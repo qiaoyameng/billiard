@@ -6,7 +6,33 @@ import pytest
 
 import billiard.pool
 from billiard import get_context
-from billiard.exceptions import TimeLimitExceeded
+from billiard.exceptions import TaskCancelledError, TimeLimitExceeded
+
+
+class BoundaryWorker(billiard.pool.Worker):
+    boundary_start = None
+    boundary_release = None
+    boundary_phase = 0
+
+    def on_syn_ack(self, job):
+        self.boundary_phase += 1
+        if self.boundary_phase == 1 and self.boundary_start is not None:
+            self.boundary_start.set()
+            self.boundary_release.wait(10)
+        return True
+
+
+class BoundaryPool(billiard.pool.Pool):
+    Worker = BoundaryWorker
+
+    def __init__(self, *args, boundary_start=None, boundary_release=None,
+                 **kwargs):
+        BoundaryWorker.boundary_start = boundary_start
+        BoundaryWorker.boundary_release = boundary_release
+        BoundaryWorker.boundary_phase = 0
+        self._boundary_start = boundary_start
+        self._boundary_release = boundary_release
+        super().__init__(*args, **kwargs)
 
 
 def func(x):
@@ -23,12 +49,47 @@ def get_on_ready_count():
 def simple_task(x):
     return x * 2
 
+
+def event_simple_task(args):
+    key, x = args
+    TASK_EVENTS[key].set()
+    return x * 2
+
+
+def marked_simple_task(x):
+    marker = os.environ.get('BILLIARD_CANCEL_MARKER')
+    if marker:
+        with open(marker, 'w'):
+            pass
+    return x * 2
+
+
+TASK_EVENTS = {}
+
 def raise_base_exception():
     raise BaseException("base exception test")
 
 
 def raise_system_exit():
     raise SystemExit(1)
+
+
+def wait_named_event(key):
+    TASK_EVENTS[key].wait(10)
+
+
+def named_blocking_task(key):
+    TASK_EVENTS[key + ':entered'].set()
+    TASK_EVENTS[key + ':release'].wait(10)
+    return 'finished'
+
+
+def named_blocking_tuple(key):
+    (key,) = key
+    TASK_EVENTS[key + ':entered'].set()
+    TASK_EVENTS[key + ':release'].wait(10)
+    return 'finished'
+
 
 class test_pool:
     def test_memory_error_from_callback_propagates(self):
@@ -124,6 +185,148 @@ class test_pool:
             raise
         pool.terminate()
         pool.join()
+
+    def test_cancel_pending_task_guarantees_function_does_not_run(
+            self, tmp_path, monkeypatch):
+        ctx = get_context()
+        barrier = ctx.Event()
+        TASK_EVENTS['pending-barrier'] = barrier
+        marker = tmp_path / 'ran'
+        monkeypatch.setenv('BILLIARD_CANCEL_MARKER', str(marker))
+        pool = billiard.pool.Pool(1, synack=True, context=ctx)
+        try:
+            running = pool.apply_async(wait_named_event, ('pending-barrier',))
+            cancelled = pool.apply_async(marked_simple_task, (400,))
+
+            assert cancelled.status() == billiard.pool.TASK_PENDING
+            assert cancelled.cancel() is True
+            assert cancelled.status() == billiard.pool.TASK_CANCELLED
+            barrier.set()
+            assert running.get(10) is None
+            with pytest.raises(TaskCancelledError):
+                cancelled.get(10)
+            assert not marker.exists()
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_started_task_is_not_cancelled_and_is_not_killed(self):
+        ctx = get_context()
+        entered = ctx.Event()
+        release = ctx.Event()
+        TASK_EVENTS['started:entered'] = entered
+        TASK_EVENTS['started:release'] = release
+        pool = billiard.pool.Pool(1, synack=True, context=ctx)
+        try:
+            result = pool.apply_async(named_blocking_task, ('started',))
+            assert entered.wait(10)
+            assert result.status() == billiard.pool.TASK_STARTED
+            pid_before = pool._pool[0].pid
+            assert result.cancel() is False
+            assert pool._pool[0].pid == pid_before
+            release.set()
+            assert result.get(10) == 'finished'
+        finally:
+            pool.terminate()
+            pool.join()
+
+    @pytest.mark.parametrize('allow_start', [False, True])
+    def test_cancel_race_at_start_boundary(self, allow_start):
+        worker_start = get_context().Event()
+        worker_release = get_context().Event()
+        function_started = get_context().Event()
+        TASK_EVENTS['race-started'] = function_started
+        pool = BoundaryPool(
+            1, synack=True,
+            boundary_start=worker_start,
+            boundary_release=worker_release,
+        )
+        try:
+            result = pool.apply_async(
+                event_simple_task, (('race-started', 7),))
+            assert worker_start.wait(10)
+            assert result.status() == billiard.pool.TASK_RECEIVED
+
+            if allow_start:
+                worker_release.set()
+                function_started.wait(10)
+                assert result.cancel() is False
+                assert result.get(10) == 14
+            else:
+                assert result.cancel() is True
+                worker_release.set()
+                assert result.status() == billiard.pool.TASK_CANCELLED
+                with pytest.raises(TaskCancelledError):
+                    result.get(10)
+                assert not function_started.is_set()
+        finally:
+            worker_release.set()
+            pool.terminate()
+            pool.join()
+
+    def test_cancel_is_idempotent_after_terminal_result(self):
+        pool = billiard.pool.Pool(1, synack=True)
+        try:
+            result = pool.apply_async(simple_task, (21,))
+            assert result.get(10) == 42
+            assert result.status() == billiard.pool.TASK_FINISHED
+            assert result.cancel() is False
+            assert result.get(10) == 42
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_cancel_requires_synack(self):
+        pool = billiard.pool.Pool(1)
+        try:
+            result = pool.apply_async(simple_task, (1,))
+            with pytest.raises(RuntimeError, match='synack=True'):
+                result.cancel()
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_late_result_does_not_override_cancelled_terminal_state(self):
+        result = billiard.pool.ApplyResult(
+            {}, None, control_writer=True, send_ack=lambda *a: None,
+        )
+        result._cancelled = True
+        result._state = billiard.pool.TASK_CANCELLED
+        result._set_cancelled_locked()
+
+        result._set(None, (True, 'late result'))
+
+        with pytest.raises(TaskCancelledError):
+            result.get()
+
+    def test_map_cancel_uses_whole_chunks_only(self):
+        ctx = get_context()
+        entered = ctx.Event()
+        release = ctx.Event()
+        TASK_EVENTS['map:entered'] = entered
+        TASK_EVENTS['map:release'] = release
+        pool = billiard.pool.Pool(1, synack=True, context=ctx)
+        try:
+            running = pool.map_async(
+                named_blocking_tuple, [('map',)], chunksize=1,
+            )
+            assert entered.wait(10)
+            pending = pool.map_async(simple_task, range(8), chunksize=4)
+            assert running.chunk_status(0) == billiard.pool.TASK_STARTED
+            assert pending.chunk_status(0) == billiard.pool.TASK_PENDING
+            assert pending.chunk_status(1) == billiard.pool.TASK_PENDING
+            assert running.cancel(0) is False
+            assert pending.cancel(0) is True
+            assert pending.cancel(1) is True
+            assert pending.chunk_status(1) == billiard.pool.TASK_CANCELLED
+            assert pending.cancel() is False
+            release.set()
+            assert running.get(10) == ['finished']
+            with pytest.raises(TaskCancelledError):
+                pending.get(10)
+        finally:
+            pool.terminate()
+            pool.join()
 
     def test_on_ready_counter_is_synchronized(self):
         for ctx in ('spawn', 'fork', 'forkserver'):

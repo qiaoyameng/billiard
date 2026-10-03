@@ -42,6 +42,13 @@ class Terminated(Exception):
     """The worker processing a job has been terminated by user request."""
 
 
+class TaskCancelledError(Exception):
+    """The task was cancelled before its user function started."""
+
+
+CancelledError = TaskCancelledError
+
+
 class RestartFreqExceeded(Exception):
     """Restarts too fast."""
 

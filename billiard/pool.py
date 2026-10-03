@@ -36,6 +36,7 @@ from .exceptions import (
     CoroStop,
     RestartFreqExceeded,
     SoftTimeLimitExceeded,
+    TaskCancelledError,
     Terminated,
     TimeLimitExceeded,
     TimeoutError,
@@ -91,6 +92,14 @@ READY = 1
 TASK = 2
 NACK = 3
 DEATH = 4
+START = 5
+
+# Result lifecycle states exposed by cancellable results.
+TASK_PENDING = 'PENDING'
+TASK_RECEIVED = 'RECEIVED'
+TASK_STARTED = 'STARTED'
+TASK_CANCELLED = 'CANCELLED'
+TASK_FINISHED = 'FINISHED'
 
 #
 # Exit code constants
@@ -337,11 +346,13 @@ class Worker:
                     error('!!!WAIT FOR ACK TIMEOUT: job:%r fd:%r!!!',
                           jid, self.synq._reader.fileno(), exc_info=1)
                 req = _wait_for_syn()
-                if req:
-                    type_, args = req
-                    if type_ == NACK:
+                if req is not None:
+                    response = req
+                    if response == ACK and not self.on_syn_ack(jid):
                         return False
-                    assert type_ == ACK
+                    if response == NACK:
+                        return False
+                    assert response == ACK
                     return True
                 i += 1
 
@@ -352,12 +363,18 @@ class Worker:
                 if req:
                     type_, args_ = req
                     assert type_ == TASK
-                    job, i, fun, args, kwargs = args_
+                    job, i, fun, args, kwargs = args_[:5]
+                    cancellable = len(args_) > 5 and args_[5]
                     put((ACK, (job, i, now(), pid, synqW_fd)))
                     if _wait_for_syn:
                         confirm = wait_for_syn(job)
                         if not confirm:
                             continue  # received NACK
+                        if cancellable:
+                            put((START, (job, i, pid, synqW_fd)))
+                            confirm = wait_for_syn(job)
+                            if not confirm:
+                                continue
                     exit_exc = None
                     try:
                         result = (True, prepare_result(fun(*args, **kwargs)))
@@ -440,6 +457,9 @@ class Worker:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except AttributeError:
             pass
+
+    def on_syn_ack(self, job):
+        return True
 
     def _make_recv_method(self, conn):
         get = conn.get
@@ -844,6 +864,12 @@ class ResultHandler(PoolThread):
             except KeyError:
                 pass
 
+        def on_start(job, i, pid, synqW_fd):
+            try:
+                cache[job]._start(i, pid, synqW_fd)
+            except (KeyError, AttributeError):
+                pass
+
         def on_death(pid, exitcode):
             try:
                 os.kill(pid, TERM_SIGNAL)
@@ -852,7 +878,8 @@ class ResultHandler(PoolThread):
                     raise
 
         state_handlers = self.state_handlers = {
-            ACK: on_ack, READY: on_ready, DEATH: on_death
+            ACK: on_ack, READY: on_ready, DEATH: on_death,
+            START: on_start,
         }
 
         def on_state_change(task):
@@ -1069,6 +1096,8 @@ class Pool:
 
         self._pool = []
         self._poolctrl = {}
+        self._syn_writers = {}
+        self._syn_queues = {}
         self._on_ready_counters = {}
         self.putlocks = putlocks
         self._putlock = semaphore or LaxBoundedSemaphore(self._processes)
@@ -1164,7 +1193,8 @@ class Pool:
         ), (None, None))
 
     def get_process_queues(self):
-        return self._inqueue, self._outqueue, None
+        synq = self._ctx.SimpleQueue() if self.synack else None
+        return self._inqueue, self._outqueue, synq
 
     def _create_worker_process(self, i):
         sentinel = self._ctx.Event() if self.allow_restart else None
@@ -1180,6 +1210,9 @@ class Pool:
             max_memory_per_child=self._max_memory_per_child,
             on_ready_counter=on_ready_counter,
         ))
+        if synq is not None:
+            self._syn_writers[synq._writer.fileno()] = synq._writer
+            self._syn_queues[synq._writer.fileno()] = synq
         self._pool.append(w)
         self._process_register_queues(w, (inq, outq, synq))
         w.name = w.name.replace('Process', 'PoolWorker')
@@ -1239,6 +1272,12 @@ class Pool:
                 del self._pool[i]
                 del self._poolctrl[worker.pid]
                 del self._on_ready_counters[worker.pid]
+                syn_writer = getattr(worker, 'synqW_fd', None)
+                if syn_writer is not None:
+                    self._syn_writers.pop(syn_writer, None)
+                    synq = self._syn_queues.pop(syn_writer, None)
+                    if synq is not None:
+                        synq.close()
         if cleaned:
             all_pids = [w.pid for w in self._pool]
             for job in list(self._cache.values()):
@@ -1291,6 +1330,11 @@ class Pool:
         job._worker_lost = (monotonic(), exitcode)
 
     def mark_as_worker_lost(self, job, exitcode):
+        if getattr(job, '_state', None) == TASK_CANCELLED and not job.ready():
+            with job._mutex:
+                if not job.ready():
+                    job._set_cancelled_locked()
+            return
         try:
             raise WorkerLostError(
                 'Worker exited prematurely: {0} Job: {1}.'.format(
@@ -1513,6 +1557,8 @@ class Pool:
 
         Callback is called when the functions return value is ready.
         The accept callback is called when the job is accepted to be executed.
+        With ``Pool(synack=True)``, the result supports ``status()`` and
+        ``cancel()``; cancellation succeeds only before the user function runs.
 
         Simplified the flow is like this:
 
@@ -1547,19 +1593,24 @@ class Pool:
                 callbacks_propagate=callbacks_propagate,
                 send_ack=self.send_ack if self.synack else None,
                 correlation_id=correlation_id,
+                control_writer=True if self.synack and self.threads else None,
             )
             if timeout or soft_timeout:
                 # start the timeout handler thread when required.
                 self._start_timeout_handler()
             if self.threads:
-                self._taskqueue.put(([(TASK, (result._job, None,
-                                    func, args, kwds))], None))
+                task = (result._job, None, func, args, kwds, True)
+                self._taskqueue.put(([(TASK, task)], None))
             else:
-                self._quick_put((TASK, (result._job, None, func, args, kwds)))
+                self._quick_put(
+                    (TASK, (result._job, None, func, args, kwds, False)),
+                )
             return result
 
     def send_ack(self, response, job, i, fd):
-        pass
+        writer = self._syn_writers.get(fd)
+        if writer is not None:
+            writer.send(response)
 
     def terminate_job(self, pid, sig=None):
         proc, _ = self._process_by_pid(pid)
@@ -1599,11 +1650,17 @@ class Pool:
         if len(iterable) == 0:
             chunksize = 0
 
-        task_batches = Pool._get_tasks(func, iterable, chunksize)
-        result = MapResult(self._cache, chunksize, len(iterable), callback,
-                           error_callback=error_callback)
-        self._taskqueue.put((((TASK, (result._job, i, mapper, (x,), {}))
-                              for i, x in enumerate(task_batches)), None))
+        task_batches = list(Pool._get_tasks(func, iterable, chunksize))
+        result = MapResult(
+            self._cache, chunksize, len(iterable), callback,
+            error_callback=error_callback,
+            controls=([True] * len(task_batches)
+                      if self.synack and self.threads else None),
+            send_ack=self.send_ack if self.synack and self.threads else None,
+        )
+        tasks = ((TASK, (result._job, i, mapper, (x,), {}, True))
+                 for i, x in enumerate(task_batches))
+        self._taskqueue.put((tasks, None))
         return result
 
     @staticmethod
@@ -1751,7 +1808,7 @@ class ApplyResult:
                  timeout=None, lost_worker_timeout=LOST_WORKER_TIMEOUT,
                  on_timeout_set=None, on_timeout_cancel=None,
                  callbacks_propagate=(), send_ack=None,
-                 correlation_id=None):
+                 correlation_id=None, control_writer=None):
         self.correlation_id = correlation_id
         self._mutex = Lock()
         self._event = threading.Event()
@@ -1771,6 +1828,9 @@ class ApplyResult:
 
         self._accepted = False
         self._cancelled = False
+        self._state = TASK_PENDING
+        self._control_writer = control_writer
+        self._control_fd = None
         self._worker_pid = None
         self._time_accepted = None
         self._terminated = None
@@ -1788,13 +1848,65 @@ class ApplyResult:
     def accepted(self):
         return self._accepted
 
+    def status(self):
+        """Return PENDING, RECEIVED, STARTED, CANCELLED or FINISHED."""
+        with self._mutex:
+            return self._state
+
+    def cancel(self):
+        """Cancel a task before its user function has started."""
+        with self._mutex:
+            if self._event.is_set():
+                return False
+            if self._control_writer is None:
+                raise RuntimeError(
+                    'task cancellation requires Pool(synack=True)'
+                )
+            if self._state == TASK_PENDING:
+                self._cancelled = True
+                self._state = TASK_CANCELLED
+                return True
+            if self._state == TASK_RECEIVED:
+                self._send_control(NACK)
+                self._close_control()
+                self._set_cancelled_locked()
+                self._cache.pop(self._job, None)
+                return True
+            return False
+
     def successful(self):
         assert self.ready()
         return self._success
 
     def _cancel(self):
-        """Only works if synack is used."""
+        self.cancel()
+
+    def _send_control(self, response):
+        if self._control_fd is None or self._send_ack is None:
+            return
+        try:
+            self._send_ack(response, self._job, None, self._control_fd)
+        except (IOError, OSError):
+            pass
+
+    def _close_control(self):
+        self._control_fd = None
+
+    def _cancelled_result(self):
+        return False, TaskCancelledError('Task cancelled before it started')
+
+    def _set_cancelled_locked(self):
+        if self._event.is_set():
+            return
+        if self._on_timeout_cancel:
+            self._on_timeout_cancel(self)
         self._cancelled = True
+        self._state = TASK_CANCELLED
+        self._success, self._value = self._cancelled_result()
+        self._event.set()
+        if self._error_callback:
+            self.safe_apply_callback(
+                self._error_callback, self._value)
 
     def discard(self):
         self._cache.pop(self._job, None)
@@ -1821,7 +1933,8 @@ class ApplyResult:
         if self._success:
             return self._value
         else:
-            raise self._value.exception
+            value = self._value
+            raise getattr(value, 'exception', value)
 
     def safe_apply_callback(self, fun, *args, **kwargs):
         if fun:
@@ -1844,15 +1957,14 @@ class ApplyResult:
 
     def _set(self, i, obj):
         with self._mutex:
+            if self._event.is_set():
+                return
             if self._on_timeout_cancel:
                 self._on_timeout_cancel(self)
             self._success, self._value = obj
+            self._state = TASK_FINISHED
             self._event.set()
-            if self._accepted:
-                # if not accepted yet, then the set message
-                # was received before the ack, which means
-                # the ack will remove the entry.
-                self._cache.pop(self._job, None)
+            self._cache.pop(self._job, None)
 
             # apply callbacks last
             if self._callback and self._success:
@@ -1865,17 +1977,22 @@ class ApplyResult:
 
     def _ack(self, i, time_accepted, pid, synqW_fd):
         with self._mutex:
-            if self._cancelled and self._send_ack:
-                self._accepted = True
-                if synqW_fd:
-                    return self._send_ack(NACK, pid, self._job, synqW_fd)
+            if self._worker_pid is None:
+                self._worker_pid = pid
+            if self._state == TASK_CANCELLED and not self.ready():
+                self._control_fd = synqW_fd
+                self._send_control(NACK)
+                self._close_control()
+                self._set_cancelled_locked()
+                self._cache.pop(self._job, None)
+                return
+            if self._state != TASK_PENDING:
                 return
             self._accepted = True
+            self._state = TASK_RECEIVED
             self._time_accepted = time_accepted
             self._worker_pid = pid
-            if self.ready():
-                # ack received after set()
-                self._cache.pop(self._job, None)
+            self._control_fd = synqW_fd
             if self._on_timeout_set:
                 self._on_timeout_set(self, self._soft_timeout, self._timeout)
             response = ACK
@@ -1888,8 +2005,28 @@ class ApplyResult:
                 except Exception:
                     response = NACK
                     # ignore other errors
-            if self._send_ack and synqW_fd:
+            if self._control_writer is not None:
+                self._send_control(response)
+                if response == NACK:
+                    self._close_control()
+            elif self._send_ack and synqW_fd:
                 return self._send_ack(response, pid, self._job, synqW_fd)
+
+    def _start(self, i, pid, synqW_fd=None):
+        with self._mutex:
+            if self._state == TASK_CANCELLED and not self.ready():
+                self._control_fd = synqW_fd
+                self._send_control(NACK)
+                self._close_control()
+                self._set_cancelled_locked()
+                self._cache.pop(self._job, None)
+                return
+            if self._state != TASK_RECEIVED:
+                return
+            self._state = TASK_STARTED
+            self._control_fd = synqW_fd
+            self._send_control(ACK)
+            self._close_control()
 
 #
 # Class whose instances are returned by `Pool.map_async()`
@@ -1898,9 +2035,16 @@ class ApplyResult:
 
 class MapResult(ApplyResult):
 
-    def __init__(self, cache, chunksize, length, callback, error_callback):
+    def __init__(self, cache, chunksize, length, callback, error_callback,
+                 controls=None, send_ack=None):
+        if controls is None:
+            chunk_count = (length // chunksize + bool(length % chunksize)
+                           if chunksize > 0 else 0)
+            controls = [None] * chunk_count
         ApplyResult.__init__(
             self, cache, callback, error_callback=error_callback,
+            control_writer=True if controls else None,
+            send_ack=send_ack,
         )
         self._success = True
         self._length = length
@@ -1910,41 +2054,179 @@ class MapResult(ApplyResult):
         self._time_accepted = [None] * length
         self._chunksize = chunksize
         if chunksize <= 0:
+            self._chunk_states = []
+            self._control_fds = []
             self._number_left = 0
-            self._event.set()
-            del cache[self._job]
+            self._finish_locked()
         else:
-            self._number_left = length // chunksize + bool(length % chunksize)
+            chunk_count = length // chunksize + bool(length % chunksize)
+            self._chunk_states = [TASK_PENDING] * chunk_count
+            self._controls_enabled = controls
+            self._control_fds = [None] * chunk_count
+            self._number_left = chunk_count
+
+    def _control_for_chunk(self, i):
+        if self._controls_enabled is None:
+            return None
+        return self._control_fds[i]
+
+    def _send_chunk_control(self, i, response):
+        fd = self._control_for_chunk(i)
+        if fd is None or self._send_ack is None:
+            return
+        try:
+            self._send_ack(response, self._job, i, fd)
+        except (IOError, OSError):
+            pass
+
+    def _close_chunk_control(self, i):
+        self._control_fds[i] = None
+
+    def _finish_locked(self):
+        if self._event.is_set():
+            return
+        if self._success:
+            self._state = TASK_FINISHED
+            if self._callback:
+                self.safe_apply_callback(self._callback, self._value)
+        else:
+            self._state = TASK_CANCELLED
+            self._success, self._value = self._cancelled_result()
+            if self._error_callback:
+                self.safe_apply_callback(
+                    self._error_callback, self._value)
+        self._event.set()
+        self._cache.pop(self._job, None)
+
+    def _cancel_chunk_locked(self, i):
+        state = self._chunk_states[i]
+        if state not in (TASK_PENDING, TASK_RECEIVED):
+            return False
+        if state == TASK_RECEIVED:
+            self._send_chunk_control(i, NACK)
+            self._close_chunk_control(i)
+            self._number_left -= 1
+        self._chunk_states[i] = TASK_CANCELLED
+        self._success = False
+        if all(state == TASK_CANCELLED for state in self._chunk_states):
+            self._state = TASK_CANCELLED
+        if self._number_left == 0:
+            self._finish_locked()
+        return True
+
+    def chunk_status(self, i):
+        with self._mutex:
+            return self._chunk_states[i]
+
+    def status(self):
+        with self._mutex:
+            if self.ready():
+                return self._state
+            states = set(self._chunk_states)
+            if TASK_STARTED in states:
+                return TASK_STARTED
+            if TASK_RECEIVED in states:
+                return TASK_RECEIVED
+            if TASK_CANCELLED in states:
+                return TASK_CANCELLED
+            return TASK_PENDING
+
+    def cancel(self, chunk=None):
+        """Cancel one whole chunk.
+
+        Without an index, cancel all chunks only when every chunk is still
+        PENDING or RECEIVED. No individual item inside a started chunk is ever
+        represented as unexecuted.
+        """
+        with self._mutex:
+            if self.ready():
+                return False
+            if self._controls_enabled is None:
+                raise RuntimeError(
+                    'task cancellation requires Pool(synack=True)'
+                )
+            selected = (range(len(self._chunk_states))
+                        if chunk is None else [chunk])
+            if chunk is None and any(
+                    self._chunk_states[i] not in
+                    (TASK_PENDING, TASK_RECEIVED)
+                    for i in selected):
+                return False
+            changed = False
+            for i in selected:
+                changed = self._cancel_chunk_locked(i) or changed
+            return changed
 
     def _set(self, i, success_result):
-        success, result = success_result
-        if success:
+        with self._mutex:
+            if self.ready() or self._chunk_states[i] == TASK_CANCELLED:
+                return
+            success, result = success_result
+            if not success:
+                self._success = False
+                self._value = result
+                self._chunk_states[i] = TASK_FINISHED
+                self._number_left = 0
+                self._finish_locked()
+                return
             self._value[i * self._chunksize:(i + 1) * self._chunksize] = result
+            self._chunk_states[i] = TASK_FINISHED
             self._number_left -= 1
             if self._number_left == 0:
-                if self._callback:
-                    self._callback(self._value)
-                if self._accepted:
-                    self._cache.pop(self._job, None)
-                self._event.set()
-        else:
-            self._success = False
-            self._value = result
-            if self._error_callback:
-                self._error_callback(self._value)
-            if self._accepted:
-                self._cache.pop(self._job, None)
-            self._event.set()
+                self._finish_locked()
+
+    def _set_cancelled_locked(self):
+        if self.ready():
+            return
+        self._success = False
+        self._value = TaskCancelledError('Task cancelled before it started')
+        self._chunk_states = [TASK_CANCELLED] * len(self._chunk_states)
+        self._number_left = 0
+        self._finish_locked()
 
     def _ack(self, i, time_accepted, pid, *args):
-        start = i * self._chunksize
-        stop = min((i + 1) * self._chunksize, self._length)
-        for j in range(start, stop):
-            self._accepted[j] = True
-            self._worker_pid[j] = pid
-            self._time_accepted[j] = time_accepted
-        if self.ready():
-            self._cache.pop(self._job, None)
+        with self._mutex:
+            state = self._chunk_states[i]
+            self._control_fds[i] = args[-1]
+            if state == TASK_CANCELLED and not self.ready():
+                for j in range(i * self._chunksize,
+                               min((i + 1) * self._chunksize,
+                                   self._length)):
+                    self._accepted[j] = True
+                    self._worker_pid[j] = pid
+                    self._time_accepted[j] = time_accepted
+                self._send_chunk_control(i, NACK)
+                self._close_chunk_control(i)
+                self._number_left -= 1
+                self._finish_locked()
+                return
+            if state != TASK_PENDING:
+                return
+            start = i * self._chunksize
+            stop = min((i + 1) * self._chunksize, self._length)
+            for j in range(start, stop):
+                self._accepted[j] = True
+                self._worker_pid[j] = pid
+                self._time_accepted[j] = time_accepted
+            self._chunk_states[i] = TASK_RECEIVED
+            self._send_chunk_control(i, ACK)
+
+    def _start(self, i, pid, synqW_fd=None):
+        with self._mutex:
+            state = self._chunk_states[i]
+            if state == TASK_CANCELLED and not self.ready():
+                self._control_fds[i] = synqW_fd
+                self._send_chunk_control(i, NACK)
+                self._close_chunk_control(i)
+                self._number_left -= 1
+                self._finish_locked()
+                return
+            if state != TASK_RECEIVED:
+                return
+            self._chunk_states[i] = TASK_STARTED
+            self._control_fds[i] = synqW_fd
+            self._send_chunk_control(i, ACK)
+            self._close_chunk_control(i)
 
     def accepted(self):
         return all(self._accepted)
