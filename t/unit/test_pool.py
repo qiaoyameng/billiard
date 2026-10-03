@@ -1,12 +1,18 @@
 import os
 import signal
+import threading
 import time
 
 import pytest
 
 import billiard.pool
 from billiard import get_context
-from billiard.exceptions import TimeLimitExceeded
+from billiard.exceptions import (
+    PoolClosedError,
+    PoolNotReadyError,
+    TimeLimitExceeded,
+    WorkerInitializationError,
+)
 
 
 def func(x):
@@ -22,6 +28,14 @@ def get_on_ready_count():
 
 def simple_task(x):
     return x * 2
+
+
+def wait_for_startup_event(event):
+    event.wait(30)
+
+
+def fail_initialization():
+    raise RuntimeError('initializer failed')
 
 def raise_base_exception():
     raise BaseException("base exception test")
@@ -45,6 +59,195 @@ class test_pool:
         assert pool.did_start_ok() is True
         pool.close()
         pool.terminate()
+
+    def test_waits_for_all_workers_to_become_ready(self):
+        pool = billiard.pool.Pool(2)
+        try:
+            assert pool.wait_ready(10) is True
+            assert pool.is_ready() is True
+            assert len(pool._ready_workers) == 2
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_rejects_tasks_until_pool_is_ready(self):
+        ctx = get_context('fork')
+        event = ctx.Event()
+        pool = billiard.pool.Pool(
+            1, wait_for_startup_event, (event,),
+            reject_tasks_when_not_ready=True,
+            context=ctx,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and pool.is_ready():
+                time.sleep(0.01)
+            with pytest.raises(PoolNotReadyError):
+                pool.apply_async(simple_task, (1,), reject_if_not_ready=True)
+
+            event.set()
+            assert pool.wait_ready(10) is True
+            assert pool.apply_async(simple_task, (1,)).get(10) == 2
+        finally:
+            event.set()
+            pool.terminate()
+            pool.join()
+
+    def test_partial_ready_does_not_open_barrier(self):
+        ctx = get_context('fork')
+        state = ctx.Value('i', 0)
+        release_first = ctx.Event()
+        release_second = ctx.Event()
+
+        def wait_for_first_worker():
+            with state.get_lock():
+                state.value += 1
+                should_release_first = state.value == 1
+            if should_release_first:
+                event = release_first
+            else:
+                event = release_second
+            event.wait(30)
+
+        pool = billiard.pool.Pool(
+            2, wait_for_first_worker,
+            context=ctx,
+        )
+        try:
+            release_first.set()
+            deadline = time.monotonic() + 10
+            while (time.monotonic() < deadline
+                   and state.value < 1):
+                time.sleep(0.01)
+            deadline = time.monotonic() + 2
+            while (time.monotonic() < deadline
+                   and len(pool._ready_workers) < 1):
+                time.sleep(0.01)
+            assert len(pool._ready_workers) == 1
+            assert pool.is_ready() is False
+            assert pool.wait_ready(0.1) is False
+
+            release_second.set()
+            assert pool.wait_ready(10) is True
+            assert pool.is_ready() is True
+        finally:
+            release_first.set()
+            release_second.set()
+            pool.terminate()
+            pool.join()
+
+    def test_initializer_failure_returns_diagnostics_and_reaps_pool(self):
+        pool = billiard.pool.Pool(
+            1, fail_initialization,
+            max_initializer_restarts=0,
+        )
+        try:
+            with pytest.raises(WorkerInitializationError) as exc_info:
+                pool.wait_ready(10)
+
+            error = exc_info.value
+            assert error.diagnostics['type'] == 'RuntimeError'
+            assert error.diagnostics['message'] == 'initializer failed'
+            assert 'exception_info' in error.diagnostics
+            assert pool._state == billiard.pool.TERMINATE
+        finally:
+            pool.join()
+            assert all(not worker.is_alive() for worker in pool._pool)
+
+    def test_initializer_restart_budget_is_limited(self):
+        pool = billiard.pool.Pool(
+            1, fail_initialization,
+            max_initializer_restarts=1,
+            max_restart_freq=100,
+        )
+        try:
+            with pytest.raises(WorkerInitializationError):
+                pool.wait_ready(10)
+
+            assert pool._initializer_restarts == 2
+            assert pool._state == billiard.pool.TERMINATE
+        finally:
+            pool.join()
+            assert all(not worker.is_alive() for worker in pool._pool)
+
+    def test_one_blocked_initializer_and_one_failed_initializer(self):
+        ctx = get_context('fork')
+        startup_count = ctx.Value('i', 0)
+        startup_lock = ctx.Lock()
+        second_worker_started = ctx.Event()
+        block_second_worker = ctx.Event()
+
+        def initializer():
+            with startup_lock:
+                startup_count.value += 1
+                should_block = startup_count.value == 2
+            if should_block:
+                second_worker_started.set()
+                block_second_worker.wait(30)
+            else:
+                second_worker_started.wait(10)
+                raise RuntimeError('initializer failed')
+
+        pool = billiard.pool.Pool(
+            2, initializer,
+            max_initializer_restarts=0,
+            max_restart_freq=100,
+            context=ctx,
+        )
+        try:
+            with pytest.raises(WorkerInitializationError) as exc_info:
+                pool.wait_ready(10)
+
+            assert exc_info.value.diagnostics['message'] == (
+                'initializer failed'
+            )
+            pool.join()
+            assert all(not worker.is_alive() for worker in pool._pool)
+            assert any(worker.exitcode < 0 for worker in pool._pool)
+        finally:
+            pool.terminate()
+
+    def test_ready_wait_returns_on_close(self):
+        ctx = get_context('fork')
+        event = ctx.Event()
+        pool = billiard.pool.Pool(
+            1, wait_for_startup_event, (event,),
+            context=ctx,
+        )
+        try:
+            errors = []
+
+            def wait_for_pool():
+                try:
+                    pool.wait_ready(10)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            waiter = threading.Thread(target=wait_for_pool)
+            waiter.start()
+            time.sleep(0.2)
+            pool.close()
+            waiter.join(5)
+            assert not waiter.is_alive()
+            assert errors and isinstance(errors[0], PoolClosedError)
+        finally:
+            pool.join()
+
+    def test_ready_timeout_terminates_pool(self):
+        ctx = get_context('fork')
+        event = ctx.Event()
+        pool = billiard.pool.Pool(
+            1, wait_for_startup_event, (event,),
+            ready_timeout=0.1,
+            context=ctx,
+        )
+        try:
+            with pytest.raises(Exception):
+                pool.wait_ready(10)
+            assert pool._state == billiard.pool.TERMINATE
+        finally:
+            pool.join()
+            assert all(not worker.is_alive() for worker in pool._pool)
 
     def test_timeout_handler_iterates_with_cache(self):
         # Given a pool

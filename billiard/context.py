@@ -26,6 +26,9 @@ from .exceptions import (  # noqa
     TimeLimitExceeded,
     SoftTimeLimitExceeded,
     WorkerLostError,
+    PoolNotReadyError,
+    PoolClosedError,
+    WorkerInitializationError,
 )
 
 
@@ -42,6 +45,9 @@ class BaseContext:
     TimeLimitExceeded = TimeLimitExceeded
     SoftTimeLimitExceeded = SoftTimeLimitExceeded
     WorkerLostError = WorkerLostError
+    PoolNotReadyError = PoolNotReadyError
+    PoolClosedError = PoolClosedError
+    WorkerInitializationError = WorkerInitializationError
 
     current_process = staticmethod(process.current_process)
     active_children = staticmethod(process.active_children)
@@ -152,15 +158,37 @@ class BaseContext:
              lost_worker_timeout=None, max_restarts=None,
              max_restart_freq=1, on_process_up=None, on_process_down=None,
              on_timeout_set=None, on_timeout_cancel=None, threads=True,
-             semaphore=None, putlocks=False, allow_restart=False):
+             semaphore=None, putlocks=False, allow_restart=False,
+             ready_timeout=None, max_initializer_restarts=None,
+             reject_tasks_when_not_ready=False,
+             max_memory_per_child=None, enable_timeouts=False):
         '''Returns a process pool object'''
         from .pool import Pool
-        return Pool(processes, initializer, initargs, maxtasksperchild,
-                    timeout, soft_timeout, lost_worker_timeout,
-                    max_restarts, max_restart_freq, on_process_up,
-                    on_process_down, on_timeout_set, on_timeout_cancel,
-                    threads, semaphore, putlocks, allow_restart,
-                    context=self.get_context())
+        return Pool(
+            processes=processes,
+            initializer=initializer,
+            initargs=initargs,
+            maxtasksperchild=maxtasksperchild,
+            timeout=timeout,
+            soft_timeout=soft_timeout,
+            lost_worker_timeout=lost_worker_timeout,
+            max_restarts=max_restarts,
+            max_restart_freq=max_restart_freq,
+            on_process_up=on_process_up,
+            on_process_down=on_process_down,
+            on_timeout_set=on_timeout_set,
+            on_timeout_cancel=on_timeout_cancel,
+            threads=threads,
+            semaphore=semaphore,
+            putlocks=putlocks,
+            allow_restart=allow_restart,
+            ready_timeout=ready_timeout,
+            max_initializer_restarts=max_initializer_restarts,
+            reject_tasks_when_not_ready=reject_tasks_when_not_ready,
+            context=self.get_context(),
+            max_memory_per_child=max_memory_per_child,
+            enable_timeouts=enable_timeouts,
+        )
 
     def RawValue(self, typecode_or_type, *args):
         '''Returns a shared object'''

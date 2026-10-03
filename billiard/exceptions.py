@@ -38,6 +38,30 @@ class WorkerLostError(Exception):
     """The worker processing a job has exited prematurely."""
 
 
+class PoolNotReadyError(Exception):
+    """The pool has not completed worker startup."""
+
+
+class PoolClosedError(Exception):
+    """The pool was closed while an operation was waiting."""
+
+
+class WorkerInitializationError(Exception):
+    """A worker failed to run its initializer."""
+
+    def __init__(self, diagnostics=None, pid=None, index=None, attempt=None):
+        self.diagnostics = diagnostics or {}
+        self.pid = pid
+        self.index = index
+        self.attempt = attempt
+        message = (
+            self.diagnostics.get('message')
+            if isinstance(self.diagnostics, dict)
+            else str(self.diagnostics)
+        ) or 'worker initialization failed'
+        super().__init__(message)
+
+
 class Terminated(Exception):
     """The worker processing a job has been terminated by user request."""
 
