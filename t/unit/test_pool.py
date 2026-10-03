@@ -23,6 +23,41 @@ def get_on_ready_count():
 def simple_task(x):
     return x * 2
 
+
+def event_controlled_long_task(started_file, release_file):
+    """Report the worker pid, then block until released by the parent."""
+    with open(started_file, 'w') as f:
+        f.write(str(os.getpid()))
+    deadline = time.monotonic() + 60
+    while not os.path.exists(release_file):
+        if time.monotonic() > deadline:
+            raise RuntimeError('timed out waiting for release file')
+        time.sleep(0.05)
+    return os.getpid()
+
+
+def recording_short_task(record_file, x):
+    """Record every execution so duplicates can be detected."""
+    with open(record_file, 'a') as f:
+        f.write('%d\n' % x)
+    return x * 2
+
+
+def file_gate_initializer(fail_file):
+    if os.path.exists(fail_file):
+        raise RuntimeError('initializer failed as requested')
+
+
+def wait_for_recycle(pool, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pool.recycle_in_progress and all(
+                w._capacity_credited for w in pool._pool):
+            return
+        time.sleep(0.1)
+    raise AssertionError('rolling recycle did not converge')
+
+
 def raise_base_exception():
     raise BaseException("base exception test")
 
@@ -215,3 +250,131 @@ class test_pool:
         ):
             with pytest.raises(TypeError, match="bool"):
                 billiard.pool.Pool(**kwargs)
+
+    def test_rolling_recycle(self, tmp_path):
+        """Two workers, one busy with an event-controlled long task.
+
+        While a rolling recycle runs, short tasks keep being submitted.
+        Verifies that no task is executed twice, the long task is not
+        interrupted, the pool never exceeds its configured size, and all
+        workers end up on the final generation.
+        """
+        started_file = tmp_path / 'long_started'
+        release_file = tmp_path / 'long_release'
+        record_file = tmp_path / 'short_record'
+        pool = billiard.pool.Pool(2)
+        try:
+            gen0_pids = {w.pid for w in pool._pool}
+            long_result = pool.apply_async(
+                event_controlled_long_task,
+                (str(started_file), str(release_file)),
+            )
+            deadline = time.monotonic() + 10
+            while not started_file.exists():
+                assert time.monotonic() < deadline, 'long task never started'
+                time.sleep(0.05)
+            long_pid = int(started_file.read_text())
+            assert long_pid in gen0_pids
+
+            pool.rolling_recycle(limit=1)
+            assert pool.recycle_in_progress
+            # a consecutive request merges into the recycle in progress
+            # instead of starting an unbounded second wave of replacements
+            pool.rolling_recycle(limit=1)
+            assert pool.generation == 2
+
+            short_results = [
+                pool.apply_async(
+                    recording_short_task, (str(record_file), i))
+                for i in range(20)
+            ]
+            # replacements are bounded: never more processes than configured
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and pool.recycle_in_progress:
+                assert len(pool._pool) <= 2
+                time.sleep(0.05)
+
+            # let the long task finish on its original, undrained worker
+            release_file.touch()
+            assert long_result.get(timeout=30) == long_pid
+            assert sorted(r.get(timeout=30) for r in short_results) == [
+                i * 2 for i in range(20)
+            ]
+
+            wait_for_recycle(pool)
+            # every short task was executed exactly once
+            executed = [int(x) for x in record_file.read_text().split()]
+            assert sorted(executed) == list(range(20))
+            # final generation: both original workers were replaced
+            assert {w._generation for w in pool._pool} == {pool.generation}
+            assert not {w.pid for w in pool._pool} & gen0_pids
+            assert pool._recycle_pending_capacity == 0
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_rolling_recycle_with_maxtasksperchild(self):
+        """Natural maxtasksperchild recycling joins the new generation
+        instead of fighting the rolling recycle."""
+        pool = billiard.pool.Pool(2, maxtasksperchild=2)
+        try:
+            pool.rolling_recycle(limit=1)
+            results = [pool.apply_async(simple_task, (i,)) for i in range(12)]
+            assert [r.get(timeout=30) for r in results] == [
+                i * 2 for i in range(12)
+            ]
+            wait_for_recycle(pool)
+            assert {w._generation for w in pool._pool} == {1}
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_rolling_recycle_retries_after_initializer_failure(
+            self, tmp_path):
+        """Replacements that fail to initialize are retried and never
+        count towards the pool capacity until they succeed."""
+        fail_file = tmp_path / 'fail_init'
+        started_pids = []
+        pool = billiard.pool.Pool(
+            1, initializer=file_gate_initializer,
+            initargs=(str(fail_file),),
+            on_process_up=lambda w: started_pids.append(w.pid))
+        try:
+            assert pool.apply_async(simple_task, (1,)).get(timeout=10) == 2
+            fail_file.touch()
+            pool.rolling_recycle(limit=1)
+            # replacements are attempted but keep failing their
+            # initializer: the recycle cannot complete and no capacity
+            # is credited to the new generation
+            deadline = time.monotonic() + 15
+            while len(started_pids) < 3:
+                assert time.monotonic() < deadline, \
+                    'failed replacements were not retried'
+                time.sleep(0.1)
+            assert pool.recycle_in_progress
+            assert not any(
+                w._generation == 1 and w._capacity_credited
+                for w in pool._pool
+            )
+            # once the initializer can succeed the recycle converges
+            fail_file.unlink()
+            wait_for_recycle(pool)
+            assert {w._generation for w in pool._pool} == {1}
+            assert pool.apply_async(simple_task, (2,)).get(timeout=10) == 4
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_rolling_recycle_validates_arguments(self):
+        pool = billiard.pool.Pool(1)
+        try:
+            with pytest.raises(TypeError, match="bool"):
+                pool.rolling_recycle(limit=True)
+            with pytest.raises(ValueError, match="positive int"):
+                pool.rolling_recycle(limit=0)
+            assert not pool.recycle_in_progress
+        finally:
+            pool.terminate()
+            pool.join()
+        with pytest.raises(RuntimeError):
+            pool.rolling_recycle()

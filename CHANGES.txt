@@ -1,5 +1,15 @@
 Unreleased
 ----------
+- Add `Pool.rolling_recycle(limit=1)` to replace all workers with a new
+  generation without killing in-flight tasks: old-generation workers are
+  drained (they stop accepting new tasks and exit after finishing their
+  current work), at most ``limit`` workers are replaced at a time, and a
+  replacement only counts towards the available pool capacity once its
+  initializer ran successfully.  Repeated calls while a recycle is in
+  progress are merged into a single target generation instead of starting
+  additional waves of replacements.  Idle workers now also wake up
+  periodically (the receive timeout is honored for `SimpleQueue`-based
+  pools), so drained workers exit promptly even when no tasks arrive.
 - `Queue.put()`, `Queue.get()` and `JoinableQueue.put()` raise `ValueError`
   when the queue is closed, as in `multiprocessing`, instead of an
   `AssertionError` (or, under `python -O`, silently dropping the item) and an

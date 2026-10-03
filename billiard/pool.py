@@ -237,13 +237,16 @@ class Worker:
     def __init__(self, inq, outq, synq=None, initializer=None, initargs=(),
                  maxtasks=None, sentinel=None, on_exit=None,
                  sigprotection=True, wrap_exception=True,
-                 max_memory_per_child=None, on_ready_counter=None):
+                 max_memory_per_child=None, on_ready_counter=None,
+                 drain_event=None, init_event=None):
         assert maxtasks is None or (type(maxtasks) == int and maxtasks > 0)
         self.initializer = initializer
         self.initargs = initargs
         self.maxtasks = maxtasks
         self.max_memory_per_child = max_memory_per_child
         self._shutdown = sentinel
+        self._drain_event = drain_event
+        self.init_event = init_event
         self.on_exit = on_exit
         self.sigprotection = sigprotection
         self.inq, self.outq, self.synq = inq, outq, synq
@@ -271,7 +274,7 @@ class Worker:
             self.inq, self.outq, self.synq, self.initializer,
             self.initargs, self.maxtasks, self._shutdown, self.on_exit,
             self.sigprotection, self.wrap_exception, self.max_memory_per_child,
-            self.on_ready_counter
+            self.on_ready_counter, self._drain_event, self.init_event
         )
 
     def __call__(self):
@@ -287,6 +290,10 @@ class Worker:
 
         self._make_child_methods()
         self.after_fork()
+        if self.init_event is not None:
+            # signal to the parent that the initializer ran successfully:
+            # only now does this worker count towards available capacity.
+            self.init_event.set()
         self.on_loop_start(pid=pid)  # callback on loop start
         try:
             sys.exit(self.workloop(pid=pid))
@@ -450,7 +457,14 @@ class Worker:
                 get_payload = conn.get_payload
 
                 def _recv(timeout, loads=pickle_loads):
-                    return True, loads(get_payload())
+                    # Poll first so the worker wakes up periodically even
+                    # when idle: the shutdown/drain events are checked
+                    # between receives.  Mutual exclusion is unchanged,
+                    # as get_payload() itself holds the queue read lock
+                    # while blocking.
+                    if _poll(timeout):
+                        return True, loads(get_payload())
+                    return False, None
             else:
                 def _recv(timeout):  # noqa
                     if _poll(timeout):
@@ -465,17 +479,27 @@ class Worker:
         return _recv
 
     def _make_child_methods(self, loads=pickle_loads):
-        self.wait_for_job = self._make_protected_receive(self.inq)
+        self.wait_for_job = self._make_protected_receive(
+            self.inq, check_drain=True)
         self.wait_for_syn = (self._make_protected_receive(self.synq)
                              if self.synq else None)
 
-    def _make_protected_receive(self, conn):
+    def _make_protected_receive(self, conn, check_drain=False):
         _receive = self._make_recv_method(conn)
         should_shutdown = self._shutdown.is_set if self._shutdown else None
+        should_drain = (self._drain_event.is_set
+                        if check_drain and self._drain_event is not None
+                        else None)
 
         def receive(debug=debug):
             if should_shutdown and should_shutdown():
                 debug('worker got sentinel -- exiting')
+                raise SystemExit(EX_OK)
+            if should_drain and should_drain():
+                # Pool requested a rolling recycle of this worker:
+                # stop accepting new tasks and exit cleanly; the parent
+                # will replace this worker with a new generation.
+                debug('worker drained -- exiting')
                 raise SystemExit(EX_OK)
             try:
                 ready, req = _receive(1.0)
@@ -1070,6 +1094,18 @@ class Pool:
         self._pool = []
         self._poolctrl = {}
         self._on_ready_counters = {}
+        # Rolling recycle state: workers created from now on belong to
+        # ``_generation``; while ``_recycle_target`` is set, workers of any
+        # older generation are drained (at most ``_recycle_limit`` at a
+        # time) and replaced by the supervisor.
+        self._generation = 0
+        self._recycle_target = None
+        self._recycle_limit = 1
+        self._recycle_lock = Lock()
+        # Task slots owed back to the putlock by drained workers, released
+        # once their replacements have successfully initialized.
+        self._recycle_pending_capacity = 0
+        self._last_join_drained = 0
         self.putlocks = putlocks
         self._putlock = semaphore or LaxBoundedSemaphore(self._processes)
         for i in range(self._processes):
@@ -1168,6 +1204,8 @@ class Pool:
 
     def _create_worker_process(self, i):
         sentinel = self._ctx.Event() if self.allow_restart else None
+        drain_event = self._ctx.Event()
+        init_event = self._ctx.Event()
         inq, outq, synq = self.get_process_queues()
         on_ready_counter = self._ctx.Value('i')
         w = self.WorkerProcess(self.Worker(
@@ -1179,12 +1217,18 @@ class Pool:
             wrap_exception=self._wrap_exception,
             max_memory_per_child=self._max_memory_per_child,
             on_ready_counter=on_ready_counter,
+            drain_event=drain_event,
+            init_event=init_event,
         ))
         self._pool.append(w)
         self._process_register_queues(w, (inq, outq, synq))
         w.name = w.name.replace('Process', 'PoolWorker')
         w.daemon = True
         w.index = i
+        w._generation = self._generation
+        w._drain_event = drain_event
+        w._init_event = init_event
+        w._capacity_credited = False
         w.start()
         self._poolctrl[w.pid] = sentinel
         self._on_ready_counters[w.pid] = on_ready_counter
@@ -1216,6 +1260,7 @@ class Pool:
             raise WorkersJoined()
 
         cleaned, exitcodes = {}, {}
+        self._last_join_drained = 0
         for i in reversed(range(len(self._pool))):
             worker = self._pool[i]
             exitcode = worker.exitcode
@@ -1228,6 +1273,12 @@ class Pool:
                 debug('Supervisor: worked %d joined', i)
                 cleaned[worker.pid] = worker
                 exitcodes[worker.pid] = exitcode
+                if getattr(worker, '_drain_event', None) is not None and \
+                        worker._drain_event.is_set():
+                    # worker was drained by a rolling recycle; its task
+                    # slot is returned only once its replacement has
+                    # successfully initialized.
+                    self._last_join_drained += 1
                 if exitcode not in (EX_OK, EX_RECYCLE) and \
                         not getattr(worker, '_controlled_termination', False):
                     error(
@@ -1370,10 +1421,82 @@ class Pool:
         """"Clean up any exited workers and start replacements for them.
         """
         joined = self._join_exited_workers()
+        drained = self._last_join_drained
         self._repopulate_pool(joined)
-        for i in range(len(joined)):
-            if self._putlock is not None:
+        if self._putlock is not None:
+            for i in range(len(joined) - drained):
                 self._putlock.release()
+        self._recycle_pending_capacity += drained
+        self._credit_ready_workers()
+        self._advance_recycle()
+
+    def _credit_ready_workers(self):
+        """Release task slots of replacements that finished initializing.
+
+        A worker only counts towards the available pool capacity once its
+        initializer ran successfully; slots owed by drained workers are
+        returned to the putlock here, one per ready replacement.
+        """
+        for worker in self._pool:
+            if getattr(worker, '_capacity_credited', True):
+                continue
+            init_event = getattr(worker, '_init_event', None)
+            if init_event is None or not init_event.is_set():
+                continue
+            worker._capacity_credited = True
+            if self._recycle_pending_capacity > 0:
+                self._recycle_pending_capacity -= 1
+                if self._putlock is not None:
+                    self._putlock.release()
+
+    def _advance_recycle(self):
+        """Drain old-generation workers up to the recycle limit.
+
+        Called from the supervisor thread after workers were reaped and
+        replacements started, so all mutations of ``self._pool`` stay in
+        a single thread.  At most ``_recycle_limit`` replacements are in
+        flight at any time: a replacement is in flight while the worker
+        it replaces is still draining, or while the replacement itself
+        has not finished initializing.
+        """
+        with self._recycle_lock:
+            target = self._recycle_target
+            limit = self._recycle_limit
+        if target is None or self._state != RUN:
+            return
+        old = [w for w in self._pool
+               if getattr(w, '_generation', target) != target]
+        if not old:
+            # The recycle is only complete once every worker belongs to
+            # the target generation *and* has successfully initialized:
+            # replacements that keep failing their initializer must not
+            # count as available capacity.
+            if len(self._pool) >= self._processes and all(
+                    getattr(w, '_capacity_credited', True)
+                    for w in self._pool):
+                with self._recycle_lock:
+                    if self._recycle_target == target:
+                        self._recycle_target = None
+                debug('rolling recycle to generation %d complete', target)
+            return
+        in_flight = 0
+        for w in self._pool:
+            drain_event = getattr(w, '_drain_event', None)
+            if drain_event is not None and drain_event.is_set():
+                in_flight += 1
+            elif getattr(w, '_generation', target) == target and \
+                    not getattr(w, '_capacity_credited', True):
+                in_flight += 1
+        budget = max(0, limit - in_flight)
+        for w in old:
+            if not budget:
+                break
+            drain_event = getattr(w, '_drain_event', None)
+            if drain_event is not None and not drain_event.is_set():
+                debug('rolling recycle: draining worker %r pid:%r',
+                      w.name, w.pid)
+                drain_event.set()
+                budget -= 1
 
     def maintain_pool(self):
         if self._worker_handler._state == RUN and self._state == RUN:
@@ -1658,6 +1781,45 @@ class Pool:
     def restart(self):
         for e in self._poolctrl.values():
             e.set()
+
+    @property
+    def generation(self):
+        """Current worker generation; bumped by every rolling recycle."""
+        return self._generation
+
+    @property
+    def recycle_in_progress(self):
+        """True while a rolling recycle has not fully converged yet."""
+        return self._recycle_target is not None
+
+    def rolling_recycle(self, limit=1):
+        """Replace all workers with a new generation, gradually.
+
+        Old-generation workers are drained: they stop accepting new tasks
+        and exit once their in-flight work completes; they are never
+        killed mid-task.  At most ``limit`` workers are replaced at any
+        given time, and a replacement only counts towards the available
+        pool capacity once it has successfully initialized.
+
+        Calling this again while a recycle is still in progress merges
+        the requests: the target generation is bumped and workers of any
+        intermediate generation are drained as well, without creating
+        additional replacement processes beyond the configured limit.
+        """
+        if isinstance(limit, bool):
+            raise TypeError(
+                f"limit must be an int, not bool (got {limit!r})")
+        if not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive int")
+        if self._state != RUN:
+            raise RuntimeError("pool is not running")
+        with self._recycle_lock:
+            self._generation += 1
+            self._recycle_target = self._generation
+            self._recycle_limit = limit
+            target = self._generation
+        debug('rolling recycle to generation %d requested (limit=%r)',
+              target, limit)
 
     @staticmethod
     def _help_stuff_finish(inqueue, task_handler, _pool):
