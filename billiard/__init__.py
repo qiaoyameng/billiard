@@ -22,6 +22,7 @@ import re
 import sys
 
 from . import context
+from .progress import ProgressEvent, ProgressGap, report_progress
 
 __version__ = '4.3.0'
 __author__ = 'R Oudkerk / Python Software Foundation'
@@ -47,7 +48,8 @@ del re
 
 globals().update((name, getattr(context._default_context, name))
                  for name in context._default_context.__all__)
-__all__ = context._default_context.__all__
+__all__ = list(context._default_context.__all__)
+__all__ += ['ProgressEvent', 'ProgressGap', 'report_progress']
 
 #
 # XXX These should not really be documented or public.

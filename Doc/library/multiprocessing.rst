@@ -1646,6 +1646,17 @@ with the :class:`Pool` class.
       Callbacks should complete immediately since otherwise the thread which
       handles the results will get blocked.
 
+      Billiard also accepts *progress_callback* and *progress_gap_callback*
+      keyword arguments. A worker can call
+      :func:`billiard.report_progress` while the task is running. Progress is
+      delivered on a separate dispatcher thread as ``ProgressEvent`` objects,
+      so a slow progress callback cannot block task ACKs or final results.
+      When progress has to be discarded, callbacks receive a ``ProgressGap``
+      describing the missing inclusive sequence range. Use
+      *progress_max_pending* and *progress_max_bytes* to bound retained
+      progress, and *progress_max_payload_bytes* to reject an individual
+      oversized report.
+
    .. method:: map(func, iterable[, chunksize])
 
       A parallel equivalent of the :func:`map` built-in function (it supports only
@@ -1741,6 +1752,20 @@ with the :class:`Pool` class.
    .. method:: wait([timeout])
 
       Wait until the result is available or until *timeout* seconds pass.
+
+   .. method:: subscribe_progress(callback[, gap_callback])
+
+      Subscribe an existing task handle to progress. If the task is still
+      running, progress produced before subscription is delivered from the
+      handle's bounded buffer. Progress arriving after completion,
+      cancellation, timeout, or worker loss is ignored; cancellation,
+      timeout, and worker loss may deliver a terminal ``ProgressGap``.
+
+   .. method:: wait_progress([timeout])
+
+      Wait for already accepted progress callbacks and gap notifications to be
+      drained. Final task results remain available through :meth:`get` even if
+      a progress callback raises.
 
    .. method:: ready()
 
@@ -2407,4 +2432,3 @@ listening socket.
 Some simple benchmarks comparing :mod:`multiprocessing` with :mod:`threading`:
 
 .. literalinclude:: ../includes/mp_benchmarks.py
-

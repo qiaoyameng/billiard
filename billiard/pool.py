@@ -14,6 +14,7 @@ import copy
 import errno
 import itertools
 import os
+import pickle
 import platform
 import signal
 import sys
@@ -25,6 +26,8 @@ from collections import deque
 from functools import partial
 
 from . import cpu_count, get_context
+from . import progress as _progress
+from .progress import ProgressEvent, ProgressGap
 from . import util
 from .common import (
     TERM_SIGNAL, human_status, pickle_loads, reset_signals, restart_state,
@@ -91,6 +94,11 @@ READY = 1
 TASK = 2
 NACK = 3
 DEATH = 4
+PROGRESS = 5
+PROGRESS_GAP = 6
+
+DEFAULT_PROGRESS_MAX_PENDING = 16
+DEFAULT_PROGRESS_MAX_BYTES = 1024 * 1024
 
 #
 # Exit code constants
@@ -250,6 +258,9 @@ class Worker:
         self.wrap_exception = wrap_exception  # XXX cannot disable yet
         self.on_ready_counter = on_ready_counter
         self.contribute_to_object(self)
+        self._progress_job = None
+        self._progress_seq = 0
+        self._progress_failed = []
 
     def contribute_to_object(self, obj):
         obj.inq, obj.outq, obj.synq = self.inq, self.outq, self.synq
@@ -318,6 +329,84 @@ class Worker:
     def prepare_result(self, result):
         return result
 
+    def _begin_progress(self, job):
+        lock = self._get_progress_lock()
+        with lock:
+            self._progress_job = job
+            self._progress_seq = 0
+            self._progress_failed = []
+        _progress._state.reporter = self
+
+    def _end_progress(self):
+        _progress._state.reporter = None
+        with self._progress_lock:
+            failed = self._progress_failed
+            self._progress_job = None
+            self._progress_seq = 0
+            self._progress_failed = []
+        return failed
+
+    def report_progress(self, payload):
+        lock = self._get_progress_lock()
+        with lock:
+            if self._progress_job is None:
+                return
+            self._progress_seq += 1
+            seq = self._progress_seq
+        try:
+            data = pickle.dumps(payload)
+        except Exception:
+            self._report_progress_gap(seq, seq, 'progress_payload_error')
+            return
+
+        with lock:
+            message = (
+                PROGRESS,
+                (self._progress_job, os.getpid(), seq,
+                 data, len(data)),
+            )
+        try:
+            put_progress = self.outq.put
+            put_progress(message)
+        except Exception:
+            with lock:
+                if self._progress_job is not None:
+                    self._progress_failed.append(
+                        (seq, 'progress_send_failed'),
+                    )
+
+    def _progress_summary(self):
+        with self._get_progress_lock():
+            if not self._progress_failed:
+                return None
+            failed = tuple(self._progress_failed)
+            return {'failed_progress': failed}
+
+    def _report_progress_gap(self, start_seq, end_seq, reason):
+        lock = self._get_progress_lock()
+        with lock:
+            if self._progress_job is None:
+                return
+            message = (
+                PROGRESS_GAP,
+                (self._progress_job, os.getpid(),
+                 start_seq, end_seq, reason),
+            )
+        try:
+            self.outq.put(message)
+        except Exception:
+            with lock:
+                if self._progress_job is not None:
+                    self._progress_failed.append(
+                        (start_seq, reason),
+                    )
+
+    def _get_progress_lock(self):
+        lock = getattr(self, '_progress_lock', None)
+        if lock is None:
+            lock = self._progress_lock = threading.Lock()
+        return lock
+
     def workloop(self, debug=debug, now=monotonic, pid=None):
         pid = pid or os.getpid()
         put = self.outq.put
@@ -358,39 +447,47 @@ class Worker:
                         confirm = wait_for_syn(job)
                         if not confirm:
                             continue  # received NACK
-                    exit_exc = None
+                    self._begin_progress(job)
                     try:
-                        result = (True, prepare_result(fun(*args, **kwargs)))
-                    except BaseException as exc:
-                        result = (False, ExceptionInfo())
-                        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
-                            # The worker was told to exit (e.g. SIGTERM from a
-                            # hard time limit): report the result, then leave
-                            # instead of re-entering the shared inqueue.
-                            exit_exc = exc
-                    try:
-                        put((READY, (job, i, result, inqW_fd)))
-                    except Exception as exc:
-                        _, _, tb = sys.exc_info()
+                        exit_exc = None
                         try:
-                            wrapped = MaybeEncodingError(exc, result[1])
-                            einfo = ExceptionInfo((
-                                MaybeEncodingError, wrapped, tb,
-                            ))
-                            put((READY, (job, i, (False, einfo), inqW_fd)))
-                        finally:
-                            del(tb)
-                    completed += 1
-                    if exit_exc is not None:
-                        raise exit_exc
-                    if max_memory_per_child > 0:
-                        used_kb = mem_rss()
-                        if used_kb <= 0:
-                            error('worker unable to determine memory usage')
-                        if used_kb > 0 and used_kb > max_memory_per_child:
-                            warning(MAXMEM_USED_FMT.format(
-                                used_kb, max_memory_per_child))
-                            return EX_RECYCLE
+                            result = (True, prepare_result(fun(*args, **kwargs)))
+                        except BaseException as exc:
+                            result = (False, ExceptionInfo())
+                            if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                                # The worker was told to exit (e.g. SIGTERM
+                                # from a hard time limit): report the result,
+                                # then leave instead of re-entering the shared
+                                # inqueue.
+                                exit_exc = exc
+                        try:
+                            put((READY, (job, i, result, inqW_fd,
+                                         self._progress_summary())))
+                        except Exception as exc:
+                            _, _, tb = sys.exc_info()
+                            try:
+                                wrapped = MaybeEncodingError(exc, result[1])
+                                einfo = ExceptionInfo((
+                                    MaybeEncodingError, wrapped, tb,
+                                ))
+                                put((READY, (job, i, (False, einfo),
+                                             inqW_fd,
+                                             self._progress_summary())))
+                            finally:
+                                del(tb)
+                        completed += 1
+                        if exit_exc is not None:
+                            raise exit_exc
+                        if max_memory_per_child > 0:
+                            used_kb = mem_rss()
+                            if used_kb <= 0:
+                                error('worker unable to determine memory usage')
+                            if used_kb > 0 and used_kb > max_memory_per_child:
+                                warning(MAXMEM_USED_FMT.format(
+                                    used_kb, max_memory_per_child))
+                                return EX_RECYCLE
+                    finally:
+                        self._end_progress()
 
             debug('worker exiting after %d tasks', completed)
             if maxtasks:
@@ -691,7 +788,9 @@ class TimeoutHandler(PoolThread):
         try:
             raise TimeLimitExceeded(job._timeout)
         except TimeLimitExceeded:
-            job._set(job._job, (False, ExceptionInfo()))
+            job._terminal_progress_gap('timed_out')
+            job._set(job._job, (False, ExceptionInfo()),
+                     reason='timed_out')
         else:  # pragma: no cover
             pass
 
@@ -821,13 +920,19 @@ class ResultHandler(PoolThread):
                 # Object gone or doesn't support _ack (e.g. IMAPIterator).
                 pass
 
-        def on_ready(job, i, obj, inqW_fd):
+        def on_ready(job, i, obj, inqW_fd, progress_info=None):
             if on_job_ready is not None:
                 on_job_ready(job, i, obj, inqW_fd)
             try:
                 item = cache[job]
             except KeyError:
                 return
+            if progress_info:
+                for seq, reason in progress_info.get('failed_progress', ()):
+                    try:
+                        item._offer_progress_gap(seq, seq, reason)
+                    except AttributeError:
+                        break
 
             if self.on_ready_counters:
                 worker_pid = next(iter(item.worker_pids()), None)
@@ -844,6 +949,22 @@ class ResultHandler(PoolThread):
             except KeyError:
                 pass
 
+        def on_progress(job, pid, seq, payload_data, size):
+            try:
+                payload = pickle.loads(payload_data)
+            except Exception:
+                try:
+                    cache[job]._offer_progress_gap(seq, seq, 'bad_payload')
+                except (KeyError, AttributeError):
+                    pass
+                return
+            try:
+                cache[job]._offer_progress(
+                    ProgressEvent(job, pid, seq, payload, size),
+                )
+            except (KeyError, AttributeError):
+                pass
+
         def on_death(pid, exitcode):
             try:
                 os.kill(pid, TERM_SIGNAL)
@@ -851,8 +972,18 @@ class ResultHandler(PoolThread):
                 if get_errno(exc) != errno.ESRCH:
                     raise
 
+        def on_progress_gap(job, pid, start_seq, end_seq, reason):
+            try:
+                cache[job]._offer_progress_gap(start_seq, end_seq, reason)
+            except (KeyError, AttributeError):
+                pass
+
         state_handlers = self.state_handlers = {
-            ACK: on_ack, READY: on_ready, DEATH: on_death
+            ACK: on_ack,
+            READY: on_ready,
+            PROGRESS: on_progress,
+            PROGRESS_GAP: on_progress_gap,
+            DEATH: on_death,
         }
 
         def on_state_change(task):
@@ -1297,7 +1428,9 @@ class Pool:
                     human_status(exitcode), job._job),
             )
         except WorkerLostError:
-            job._set(None, (False, ExceptionInfo()))
+            job._terminal_progress_gap('worker_lost')
+            job._set(None, (False, ExceptionInfo()),
+                     reason='worker_lost')
         else:  # pragma: no cover
             pass
 
@@ -1507,7 +1640,11 @@ class Pool:
                     timeout_callback=None, waitforslot=None,
                     soft_timeout=None, timeout=None, lost_worker_timeout=None,
                     callbacks_propagate=(),
-                    correlation_id=None):
+                    correlation_id=None, progress_callback=None,
+                    progress_gap_callback=None,
+                    progress_max_pending=DEFAULT_PROGRESS_MAX_PENDING,
+                    progress_max_bytes=DEFAULT_PROGRESS_MAX_BYTES,
+                    progress_max_payload_bytes=DEFAULT_PROGRESS_MAX_BYTES):
         '''
         Asynchronous equivalent of `apply()` method.
 
@@ -1547,6 +1684,11 @@ class Pool:
                 callbacks_propagate=callbacks_propagate,
                 send_ack=self.send_ack if self.synack else None,
                 correlation_id=correlation_id,
+                progress_callback=progress_callback,
+                progress_gap_callback=progress_gap_callback,
+                progress_max_pending=progress_max_pending,
+                progress_max_bytes=progress_max_bytes,
+                progress_max_payload_bytes=progress_max_payload_bytes,
             )
             if timeout or soft_timeout:
                 # start the timeout handler thread when required.
@@ -1741,6 +1883,223 @@ class Pool:
 #
 
 
+class ProgressDispatcher:
+
+    def __init__(self, result, progress_callback=None, gap_callback=None,
+                 max_pending=DEFAULT_PROGRESS_MAX_PENDING,
+                 max_bytes=DEFAULT_PROGRESS_MAX_BYTES,
+                 max_progress_bytes=None):
+        if not isinstance(max_pending, int) or max_pending < 1:
+            raise ValueError('max_pending must be at least 1')
+        if not isinstance(max_bytes, int) or max_bytes < 1:
+            raise ValueError('max_bytes must be at least 1')
+        if max_progress_bytes is None:
+            max_progress_bytes = max_bytes
+        if (not isinstance(max_progress_bytes, int) or
+                max_progress_bytes < 1):
+            raise ValueError('max_progress_bytes must be at least 1')
+        self._result = result
+        self._callback = progress_callback
+        self._gap_callback = gap_callback
+        self._max_pending = max_pending
+        self._max_bytes = max_bytes
+        self._max_progress_bytes = max_progress_bytes
+        self._condition = threading.Condition()
+        self._items = deque()
+        self._delayed = deque()
+        self._pending = 0
+        self._pending_bytes = 0
+        self._gap = None
+        self._finished = False
+        self._terminal_reason = None
+        self._thread = None
+        self._subscribed = False
+        self._last_seq = 0
+
+    def subscribe(self, progress_callback=None, gap_callback=None):
+        with self._condition:
+            if self._subscribed:
+                raise RuntimeError('progress callback already subscribed')
+            self._subscribed = True
+            if progress_callback is not None:
+                self._callback = progress_callback
+            if gap_callback is not None:
+                self._gap_callback = gap_callback
+            should_start = (
+                self._callback is not None or
+                self._gap_callback is not None
+            )
+            thread = None
+            if self._thread is None and should_start:
+                thread = self._thread = threading.Thread(
+                    target=self.run,
+                    name=f'PoolProgress-{self._result._job}',
+                )
+                thread.daemon = True
+        if thread is not None:
+            thread.start()
+
+    def wait(self, timeout=None):
+        if self._thread is not None and self._thread is not \
+                threading.current_thread():
+            self._thread.join(timeout)
+
+    def run(self):
+        while True:
+            with self._condition:
+                while not self._items and not self._finished:
+                    self._condition.wait()
+                if self._items:
+                    item = self._items.popleft()
+                else:
+                    gap = self._gap
+                    self._gap = None
+                    item = ('gap', gap) if gap is not None else None
+                    if item is None:
+                        self._thread = None
+                        self._condition.notify_all()
+                        return
+                if item is None:
+                    self._thread = None
+                    self._condition.notify_all()
+                    return
+
+            kind, value = item
+            try:
+                if kind == 'progress':
+                    if self._callback is not None:
+                        self._callback(value)
+                elif kind == 'gap':
+                    callback = self._gap_callback or self._callback
+                    if callback is not None:
+                        callback(value)
+            except MemoryError:
+                raise
+            except Exception as exc:
+                error('Pool progress callback raised exception: %r', exc,
+                      exc_info=1)
+
+            with self._condition:
+                if kind == 'progress':
+                    self._pending -= 1
+                    self._pending_bytes -= max(value.size, 0)
+                elif kind == 'gap':
+                    while self._delayed:
+                        delayed = self._delayed.popleft()
+                        self._items.append(delayed)
+                if self._gap is not None:
+                    gap = self._gap
+                    self._gap = None
+                    self._items.append(('gap', gap))
+                self._condition.notify_all()
+
+    def offer_progress(self, event):
+        with self._condition:
+            if self._finished:
+                return
+            size = max(event.size, 0)
+            if size > self._max_progress_bytes:
+                self._last_seq = event.seq
+                self._record_gap_locked(
+                    event.seq, event.seq, 'progress_too_large',
+                )
+                return
+            over_capacity = (
+                self._pending >= self._max_pending or
+                self._pending_bytes + size > self._max_bytes
+            )
+            if over_capacity:
+                self._last_seq = event.seq
+                self._record_gap_locked(
+                    event.seq, event.seq, 'progress_buffer_full',
+                )
+                return
+            self._last_seq = event.seq
+            self._pending += 1
+            self._pending_bytes += size
+            if self._has_pending_gap_locked():
+                self._delayed.append(('progress', event))
+            else:
+                self._items.append(('progress', event))
+            self._condition.notify()
+
+    def _has_pending_gap_locked(self):
+        return (
+            self._gap is not None or
+            (bool(self._items) and self._items[-1][0] == 'gap')
+        )
+
+    def _record_gap_locked(self, start, end, reason):
+        gap = self._gap
+        queued_gap = None
+        if self._items and self._items[-1][0] == 'gap':
+            queued_gap = self._items[-1][1]
+        if gap is None:
+            gap = queued_gap
+        if gap is None:
+            gap = ProgressGap(start, end, reason)
+            self._gap = gap
+        else:
+            gap.start_seq = min(gap.start_seq, start)
+            if gap.end_seq is None or end is None:
+                gap.end_seq = None
+            else:
+                gap.end_seq = max(gap.end_seq, end)
+            if not gap.reason:
+                gap.reason = reason
+        self._enqueue_gap_if_possible_locked()
+
+    def _enqueue_gap_if_possible_locked(self):
+        if self._gap is None:
+            return
+        gap = self._gap
+        self._gap = None
+        newer = deque()
+        while self._items:
+            kind, value = self._items.pop()
+            if kind == 'gap':
+                gap.start_seq = min(gap.start_seq, value.start_seq)
+                if value.end_seq is None:
+                    gap.end_seq = None
+                elif gap.end_seq is not None:
+                    gap.end_seq = max(gap.end_seq, value.end_seq)
+                if value.reason and not gap.reason:
+                    gap.reason = value.reason
+                continue
+            if value.seq >= gap.start_seq:
+                newer.appendleft((kind, value))
+            else:
+                newer.appendleft((kind, value))
+                break
+        while self._items:
+            newer.appendleft(self._items.pop())
+        self._items = newer
+        self._items.append(('gap', gap))
+        while self._delayed:
+            self._items.append(self._delayed.popleft())
+        self._condition.notify()
+
+    def terminal_gap(self, seq, reason):
+        with self._condition:
+            self._record_gap_locked(seq, seq, reason)
+
+    def terminal_gap_range(self, start_seq, end_seq, reason):
+        with self._condition:
+            self._record_gap_locked(start_seq, end_seq, reason)
+
+    def unknown_terminal_gap(self, reason):
+        with self._condition:
+            self._record_gap_locked(self._last_seq + 1, None, reason)
+
+    def finish(self, reason='completed'):
+        with self._condition:
+            if self._finished:
+                return
+            self._finished = True
+            self._terminal_reason = reason
+            self._condition.notify_all()
+
+
 class ApplyResult:
     _worker_lost = None
     _write_to = None
@@ -1751,12 +2110,24 @@ class ApplyResult:
                  timeout=None, lost_worker_timeout=LOST_WORKER_TIMEOUT,
                  on_timeout_set=None, on_timeout_cancel=None,
                  callbacks_propagate=(), send_ack=None,
-                 correlation_id=None):
+                 correlation_id=None, progress_callback=None,
+                 progress_gap_callback=None,
+                 progress_max_pending=DEFAULT_PROGRESS_MAX_PENDING,
+                 progress_max_bytes=DEFAULT_PROGRESS_MAX_BYTES,
+                 progress_max_payload_bytes=DEFAULT_PROGRESS_MAX_BYTES):
         self.correlation_id = correlation_id
         self._mutex = Lock()
         self._event = threading.Event()
         self._job = next(job_counter)
         self._cache = cache
+        self._progress = ProgressDispatcher(
+            self,
+            max_pending=progress_max_pending,
+            max_bytes=progress_max_bytes,
+            max_progress_bytes=progress_max_payload_bytes,
+        )
+        if progress_callback is not None or progress_gap_callback is not None:
+            self._progress.subscribe(progress_callback, progress_gap_callback)
         self._callback = callback
         self._accept_callback = accept_callback
         self._error_callback = error_callback
@@ -1768,7 +2139,6 @@ class ApplyResult:
         self._on_timeout_cancel = on_timeout_cancel
         self._callbacks_propagate = callbacks_propagate or ()
         self._send_ack = send_ack
-
         self._accepted = False
         self._cancelled = False
         self._worker_pid = None
@@ -1795,6 +2165,7 @@ class ApplyResult:
     def _cancel(self):
         """Only works if synack is used."""
         self._cancelled = True
+        self._finish_progress('cancelled')
 
     def discard(self):
         self._cache.pop(self._job, None)
@@ -1806,13 +2177,32 @@ class ApplyResult:
         try:
             raise Terminated(-(signum or 0))
         except Terminated:
-            self._set(None, (False, ExceptionInfo()))
+            self._set(None, (False, ExceptionInfo()), reason='terminated')
 
     def worker_pids(self):
         return [self._worker_pid] if self._worker_pid else []
 
     def wait(self, timeout=None):
         self._event.wait(timeout)
+
+    def wait_progress(self, timeout=None):
+        self._progress.wait(timeout)
+
+    def subscribe_progress(self, progress_callback=None, gap_callback=None):
+        self._progress.subscribe(progress_callback, gap_callback)
+
+    def _offer_progress(self, event):
+        self._progress.offer_progress(event)
+
+    def _offer_progress_gap(self, start_seq, end_seq, reason):
+        self._progress.terminal_gap_range(start_seq, end_seq, reason)
+
+    def _finish_progress(self, reason='completed'):
+        self._progress.finish(reason)
+
+    def _terminal_progress_gap(self, reason):
+        self._progress.unknown_terminal_gap(reason)
+        self._finish_progress(reason)
 
     def get(self, timeout=None):
         self.wait(timeout)
@@ -1842,12 +2232,13 @@ class ApplyResult:
                 timeout=self._soft_timeout if soft else self._timeout,
             )
 
-    def _set(self, i, obj):
+    def _set(self, i, obj, reason='completed'):
         with self._mutex:
             if self._on_timeout_cancel:
                 self._on_timeout_cancel(self)
             self._success, self._value = obj
             self._event.set()
+            self._finish_progress(reason)
             if self._accepted:
                 # if not accepted yet, then the set message
                 # was received before the ack, which means

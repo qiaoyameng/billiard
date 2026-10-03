@@ -152,7 +152,7 @@ class BaseContext:
              lost_worker_timeout=None, max_restarts=None,
              max_restart_freq=1, on_process_up=None, on_process_down=None,
              on_timeout_set=None, on_timeout_cancel=None, threads=True,
-             semaphore=None, putlocks=False, allow_restart=False):
+             semaphore=None, putlocks=False, allow_restart=False, **kwargs):
         '''Returns a process pool object'''
         from .pool import Pool
         return Pool(processes, initializer, initargs, maxtasksperchild,
@@ -160,7 +160,7 @@ class BaseContext:
                     max_restarts, max_restart_freq, on_process_up,
                     on_process_down, on_timeout_set, on_timeout_cancel,
                     threads, semaphore, putlocks, allow_restart,
-                    context=self.get_context())
+                    context=self.get_context(), **kwargs)
 
     def RawValue(self, typecode_or_type, *args):
         '''Returns a shared object'''
