@@ -1671,7 +1671,7 @@ with the :class:`Pool` class.
       Callbacks should complete immediately since otherwise the thread which
       handles the results will get blocked.
 
-   .. method:: imap(func, iterable[, chunksize])
+   .. method:: imap(func, iterable[, chunksize[, max_pending]])
 
       A lazier version of :meth:`map`.
 
@@ -1685,7 +1685,12 @@ with the :class:`Pool` class.
       ``next(timeout)`` will raise :exc:`multiprocessing.TimeoutError` if the
       result cannot be returned within *timeout* seconds.
 
-   .. method:: imap_unordered(func, iterable[, chunksize])
+      *max_pending* optionally limits how many input items may be submitted
+      to workers or completed but not yet consumed. With a *chunksize* larger
+      than one, a chunk consumes room for the number of input items it
+      contains.
+
+   .. method:: imap_unordered(func, iterable[, chunksize[, max_pending]])
 
       The same as :meth:`imap` except that the ordering of the results from the
       returned iterator should be considered arbitrary.  (Only when there is

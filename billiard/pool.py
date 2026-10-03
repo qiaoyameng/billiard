@@ -220,6 +220,22 @@ class MaybeEncodingError(Exception):
             self.value, self.exc)
 
 
+class _IMapClosed(Exception):
+
+    def __init__(self, result):
+        self.result = result
+        super().__init__()
+
+
+class _IMapSourceError(Exception):
+
+    def __init__(self, result, index, excinfo):
+        self.result = result
+        self.index = index
+        self.excinfo = excinfo
+        super().__init__()
+
+
 class WorkersJoined(Exception):
     """All workers have terminated."""
 
@@ -606,7 +622,8 @@ class TaskHandler(PoolThread):
                         debug('could not put task on queue')
                         break
                     except Exception:
-                        job, ind = task[:2]
+                        task_data = task[1]
+                        job, ind = task_data[0], task_data[1]
                         try:
                             cache[job]._set(ind, (False, ExceptionInfo()))
                         except KeyError:
@@ -616,9 +633,22 @@ class TaskHandler(PoolThread):
                         debug('doing set_length()')
                         set_length(i + 1)
                     continue
-                break
+                continue
+            except _IMapClosed:
+                continue
+            except _IMapSourceError as exc:
+                exc.result._wait_until_index(exc.index)
+                exc.result._set_source_error(exc.index, exc.excinfo)
+                if set_length:
+                    util.debug('doing set_length()')
+                    set_length(exc.index + 1)
+                continue
             except Exception:
-                job, ind = task[:2] if task else (0, 0)
+                if task is not None:
+                    task_data = task[1]
+                    job, ind = task_data[0], task_data[1]
+                else:
+                    job, ind = 0, 0
                 if job in cache:
                     cache[job]._set(ind + 1, (False, ExceptionInfo()))
                 if set_length:
@@ -1443,64 +1473,116 @@ class Pool:
         if self._state == RUN:
             return self.map_async(func, iterable, chunksize).get()
 
-    def imap(self, func, iterable, chunksize=1, lost_worker_timeout=None):
+    def imap(self, func, iterable, chunksize=1, lost_worker_timeout=None,
+             max_pending=None):
         '''
         Equivalent of `map()` -- can be MUCH slower than `Pool.map()`.
+
+        When ``max_pending`` is set, at most that many input items can be
+        submitted or completed but not consumed. A whole chunk counts as the
+        number of input items it contains.
         '''
-        if self._state != RUN:
-            return
-        lost_worker_timeout = lost_worker_timeout or self.lost_worker_timeout
-        if chunksize == 1:
-            result = IMapIterator(self._cache,
-                                  lost_worker_timeout=lost_worker_timeout)
-            self._taskqueue.put((
-                ((TASK, (result._job, i, func, (x,), {}))
-                 for i, x in enumerate(iterable)),
-                result._set_length,
-            ))
-            return result
-        else:
-            assert chunksize > 1
-            task_batches = Pool._get_tasks(func, iterable, chunksize)
-            result = IMapIterator(self._cache,
-                                  lost_worker_timeout=lost_worker_timeout)
-            self._taskqueue.put((
-                ((TASK, (result._job, i, mapstar, (x,), {}))
-                 for i, x in enumerate(task_batches)),
-                result._set_length,
-            ))
-            return (item for chunk in result for item in chunk)
+        return self._imap(
+            IMapIterator, func, iterable, chunksize,
+            lost_worker_timeout, max_pending,
+        )
 
     def imap_unordered(self, func, iterable, chunksize=1,
-                       lost_worker_timeout=None):
+                       lost_worker_timeout=None, max_pending=None):
         '''
         Like `imap()` method but ordering of results is arbitrary.
+        ``max_pending`` has the same meaning as in :meth:`imap`.
         '''
+        return self._imap(
+            IMapUnorderedIterator, func, iterable, chunksize,
+            lost_worker_timeout, max_pending,
+        )
+
+    def _imap(self, result_cls, func, iterable, chunksize,
+              lost_worker_timeout, max_pending):
         if self._state != RUN:
             return
+        if (
+            not isinstance(chunksize, int)
+            or isinstance(chunksize, bool)
+            or chunksize < 1
+        ):
+            raise ValueError('chunksize must be a positive int')
+
         lost_worker_timeout = lost_worker_timeout or self.lost_worker_timeout
+        max_pending = self._validate_imap_max_pending(max_pending)
+        result = result_cls(
+            self._cache,
+            max_pending=max_pending,
+            lost_worker_timeout=lost_worker_timeout,
+        )
+        task_func = func if chunksize == 1 else mapstar
+        taskseq = self._imap_tasks(
+            result, task_func, func, iterable, chunksize, max_pending,
+        )
+        self._taskqueue.put((taskseq, result._set_length))
         if chunksize == 1:
-            result = IMapUnorderedIterator(
-                self._cache, lost_worker_timeout=lost_worker_timeout,
-            )
-            self._taskqueue.put((
-                ((TASK, (result._job, i, func, (x,), {}))
-                 for i, x in enumerate(iterable)),
-                result._set_length,
-            ))
             return result
-        else:
-            assert chunksize > 1
-            task_batches = Pool._get_tasks(func, iterable, chunksize)
-            result = IMapUnorderedIterator(
-                self._cache, lost_worker_timeout=lost_worker_timeout,
-            )
-            self._taskqueue.put((
-                ((TASK, (result._job, i, mapstar, (x,), {}))
-                 for i, x in enumerate(task_batches)),
-                result._set_length,
-            ))
-            return (item for chunk in result for item in chunk)
+        return result._flatten_chunks()
+
+    @staticmethod
+    def _validate_imap_max_pending(max_pending):
+        if max_pending is None:
+            return None
+        if isinstance(max_pending, bool) or not isinstance(max_pending, int):
+            raise TypeError('max_pending must be a positive int or None')
+        if max_pending < 1:
+            raise ValueError('max_pending must be a positive int or None')
+        return max_pending
+
+    def _imap_tasks(self, result, task_func, func, iterable,
+                    chunksize, max_pending):
+        source = iter(iterable)
+        index = 0
+
+        def make_task(batch):
+            args = ((func, batch),) if task_func is mapstar else batch
+            return TASK, (result._job, index, task_func, args, {})
+
+        while True:
+            chunk = []
+            exhausted = False
+            source_failed = False
+            try:
+                while len(chunk) < chunksize:
+                    if result._closed:
+                        raise _IMapClosed(result)
+                    if max_pending is not None:
+                        result._reserve(1)
+                    chunk.append(next(source))
+            except StopIteration:
+                exhausted = True
+            except Exception:
+                source_excinfo = ExceptionInfo()
+                source_failed = True
+            if source_failed:
+                if not chunk:
+                    raise _IMapSourceError(result, index, source_excinfo)
+                batch = tuple(chunk)
+                result._set_task_size(index, len(batch))
+                if result._closed:
+                    raise _IMapClosed(result)
+                yield make_task(batch)
+                index += 1
+                raise _IMapSourceError(result, index, source_excinfo)
+
+            if not chunk:
+                return
+
+            batch = tuple(chunk)
+            result._set_task_size(index, len(batch))
+            if result._closed:
+                raise _IMapClosed(result)
+            yield make_task(batch)
+            index += 1
+
+            if exhausted:
+                return
 
     def apply_async(self, func, args=(), kwds={},
                     callback=None, error_callback=None, accept_callback=None,
@@ -1959,8 +2041,11 @@ class MapResult(ApplyResult):
 
 class IMapIterator:
     _worker_lost = None
+    _write_to = None
+    _scheduled_for = None
 
-    def __init__(self, cache, lost_worker_timeout=LOST_WORKER_TIMEOUT):
+    def __init__(self, cache, max_pending=None,
+                 lost_worker_timeout=LOST_WORKER_TIMEOUT):
         self._cond = threading.Condition(threading.Lock())
         self._job = next(job_counter)
         self._cache = cache
@@ -1969,6 +2054,10 @@ class IMapIterator:
         self._length = None
         self._ready = False
         self._unsorted = {}
+        self._closed = False
+        self._max_pending = max_pending
+        self._pending = 0
+        self._task_sizes = {}
         self._worker_pids = []
         self._lost_worker_timeout = lost_worker_timeout
         cache[self._job] = self
@@ -1976,24 +2065,93 @@ class IMapIterator:
     def __iter__(self):
         return self
 
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        with self._cond:
+            if self._closed:
+                return
+            self._closed = True
+            self._items.clear()
+            self._unsorted.clear()
+            self._pending = 0
+            self._length = self._index
+            self._ready = True
+            self._cache.pop(self._job, None)
+            self._cond.notify_all()
+
+    def pending(self):
+        with self._cond:
+            return self._pending
+
+    def _reserve(self, units):
+        with self._cond:
+            while (
+                not self._closed
+                and self._max_pending is not None
+                and self._pending + units > self._max_pending
+            ):
+                self._cond.wait()
+            if self._closed:
+                raise _IMapClosed(self)
+            self._pending += units
+
+    def _set_task_size(self, index, size):
+        with self._cond:
+            if not self._closed:
+                self._task_sizes[index] = size
+
+    def _wait_until_index(self, index):
+        while True:
+            with self._cond:
+                if self._index >= index:
+                    return
+                if self._closed:
+                    raise _IMapClosed(self)
+                self._cond.wait(0.01)
+
+    def _release_pending(self, units):
+        with self._cond:
+            if self._max_pending is not None and units:
+                self._pending -= units
+                self._cond.notify()
+
+    def _get_item(self):
+        return self._items.popleft()
+
+    def _consume_item(self, item):
+        self._release_pending(item[1])
+        return item[0]
+
+    def _finish_if_ready(self):
+        if self._index == self._length:
+            self._ready = True
+            self._cache.pop(self._job, None)
+            self._cond.notify_all()
+
     def next(self, timeout=None):
         with self._cond:
+            deadline = monotonic() + timeout if timeout is not None else None
             try:
-                item = self._items.popleft()
+                item = self._get_item()
             except IndexError:
-                if self._index == self._length:
-                    self._ready = True
-                    raise StopIteration
-                self._cond.wait(timeout)
-                try:
-                    item = self._items.popleft()
-                except IndexError:
+                while True:
                     if self._index == self._length:
                         self._ready = True
                         raise StopIteration
-                    raise TimeoutError
+                    if deadline is None:
+                        self._cond.wait(1)
+                    else:
+                        remaining = deadline - monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError
+                        self._cond.wait(min(1, remaining))
+                    if self._items:
+                        item = self._get_item()
+                        break
 
-        success, value = item
+        success, value = self._consume_item(item)
         if success:
             return value
         raise Exception(value)
@@ -2002,28 +2160,69 @@ class IMapIterator:
 
     def _set(self, i, obj):
         with self._cond:
-            if self._index == i:
-                self._items.append(obj)
-                self._index += 1
-                while self._index in self._unsorted:
-                    obj = self._unsorted.pop(self._index)
-                    self._items.append(obj)
-                    self._index += 1
-                self._cond.notify()
-            else:
-                self._unsorted[i] = obj
-
-            if self._index == self._length:
-                self._ready = True
-                del self._cache[self._job]
+            if self._closed:
+                return
+            units = self._task_sizes.get(i, 1)
+            self._set_locked(i, obj, units)
 
     def _set_length(self, length):
         with self._cond:
+            if self._closed:
+                return
             self._length = length
             if self._index == self._length:
                 self._ready = True
+                self._cache.pop(self._job, None)
                 self._cond.notify()
-                del self._cache[self._job]
+
+    def _set_source_error(self, index, excinfo):
+        with self._cond:
+            if self._closed:
+                return
+            self._set_locked(index, (False, excinfo), 0)
+
+    def _set_locked(self, i, obj, units):
+        if self._index == i:
+            self._items.append((obj, units))
+            self._index += 1
+            while self._index in self._unsorted:
+                pending = self._unsorted.pop(self._index)
+                self._items.append(pending)
+                self._index += 1
+            self._cond.notify()
+        else:
+            self._unsorted[i] = (obj, units)
+            self._cond.notify_all()
+        self._finish_if_ready()
+
+    def _flatten_chunks(self):
+        try:
+            while True:
+                with self._cond:
+                    try:
+                        item = self._get_item()
+                    except IndexError:
+                        if self._index == self._length:
+                            self._ready = True
+                            return
+                        while not self._items and self._index != self._length:
+                            self._cond.wait(1)
+                        try:
+                            item = self._get_item()
+                        except IndexError:
+                            if self._index == self._length:
+                                self._ready = True
+                                return
+                            raise TimeoutError
+                success, chunk = item[0]
+                if not success:
+                    self._release_pending(item[1])
+                    raise Exception(chunk)
+                for value in chunk:
+                    self._release_pending(1)
+                    yield value
+        finally:
+            self.close()
 
     def _ack(self, i, time_accepted, pid, *args):
         self._worker_pids.append(pid)
@@ -2043,12 +2242,16 @@ class IMapUnorderedIterator(IMapIterator):
 
     def _set(self, i, obj):
         with self._cond:
-            self._items.append(obj)
+            if self._closed:
+                return
+            units = self._task_sizes.get(i, 1)
+            self._items.append((obj, units))
             self._index += 1
             self._cond.notify()
             if self._index == self._length:
                 self._ready = True
-                del self._cache[self._job]
+                self._cache.pop(self._job, None)
+                self._cond.notify_all()
 
 #
 #

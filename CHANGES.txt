@@ -1,5 +1,9 @@
 Unreleased
 ----------
+- Added ``max_pending`` to ``Pool.imap()`` and ``Pool.imap_unordered()`` so
+  infinite input generators are not pulled ahead of the consumer. The window
+  counts submitted work and completed, not-yet-consumed results in input-item
+  units, including work batched with a larger ``chunksize``.
 - `Queue.put()`, `Queue.get()` and `JoinableQueue.put()` raise `ValueError`
   when the queue is closed, as in `multiprocessing`, instead of an
   `AssertionError` (or, under `python -O`, silently dropping the item) and an

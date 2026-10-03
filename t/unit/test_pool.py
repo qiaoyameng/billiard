@@ -1,10 +1,12 @@
 import os
 import signal
+import threading
 import time
 
 import pytest
 
 import billiard.pool
+from billiard.pool import IMapIterator, IMapUnorderedIterator, mapstar
 from billiard import get_context
 from billiard.exceptions import TimeLimitExceeded
 
@@ -23,6 +25,15 @@ def get_on_ready_count():
 def simple_task(x):
     return x * 2
 
+
+def boom(x):
+    raise ValueError(x)
+
+
+def raising_source():
+    yield 0
+    raise RuntimeError('source failed')
+
 def raise_base_exception():
     raise BaseException("base exception test")
 
@@ -30,7 +41,164 @@ def raise_base_exception():
 def raise_system_exit():
     raise SystemExit(1)
 
+
 class test_pool:
+    def test_imap_max_pending_counts_buffered_results(self):
+        result = IMapIterator({}, max_pending=2)
+        result._reserve(2)
+        result._set_task_size(0, 1)
+        result._set_task_size(1, 1)
+        result._set_length(3)
+        result._set(0, (True, 0))
+        result._set(1, (True, 1))
+
+        assert result.pending() == 2
+        assert result.next(timeout=1) == 0
+        assert result.pending() == 1
+
+        def reserve_more():
+            result._reserve(2)
+
+        thread = threading.Thread(target=reserve_more)
+        thread.start()
+        thread.join(timeout=0.1)
+        assert thread.is_alive()
+        assert result.pending() == 1
+        assert result.next(timeout=1) == 1
+        thread.join(timeout=0.1)
+        assert not thread.is_alive()
+        assert result.pending() == 2
+        result.close()
+
+    @pytest.mark.parametrize(
+        'iterator_cls', (IMapIterator, IMapUnorderedIterator)
+    )
+    def test_imap_max_pending_chunks_are_counted_by_items(
+        self, iterator_cls,
+    ):
+        result = iterator_cls({}, max_pending=2)
+        result._reserve(2)
+        result._set_task_size(0, 2)
+        result._set_length(1)
+        result._set(0, (True, [0, 1]))
+
+        assert result.pending() == 2
+
+        def reserve_next_chunk():
+            result._reserve(2)
+
+        thread = threading.Thread(target=reserve_next_chunk)
+        thread.start()
+        thread.join(timeout=0.1)
+        assert thread.is_alive()
+
+        flatten = result._flatten_chunks()
+        assert next(flatten) == 0
+        assert result.pending() == 1
+        assert next(flatten) == 1
+        thread.join(timeout=1)
+        assert result.pending() == 2
+        result.close()
+
+    def test_imap_tasks_do_not_pull_past_item_budget(self):
+        pulled = []
+
+        def source():
+            for value in range(10):
+                pulled.append(value)
+                yield value
+
+        pool = billiard.pool.Pool(1)
+        result = IMapIterator(pool._cache, max_pending=3)
+        try:
+            tasks = pool._imap_tasks(
+                result, mapstar, simple_task, source(), 2, 3,
+            )
+            task = next(tasks)
+            assert pulled == [0, 1]
+            assert result.pending() == 2
+
+            result._set(0, (True, [0, 2]))
+            assert result.next(timeout=1) == [0, 2]
+
+            task = next(tasks)
+            assert pulled == [0, 1, 2, 3]
+            assert result.pending() == 2
+        finally:
+            result.close()
+            pool.terminate()
+            pool.join()
+
+    def test_imap_early_close_stops_pulling_source(self):
+        result = IMapIterator({}, max_pending=2)
+        result._reserve(2)
+        result.close()
+        with pytest.raises(billiard.pool._IMapClosed):
+            result._reserve(1)
+
+    @pytest.mark.parametrize('chunksize', (1, 2))
+    def test_imap_source_exception_does_not_block_producer(self, chunksize):
+        pool = billiard.pool.Pool(2)
+        try:
+            iterator = pool.imap(
+                simple_task, raising_source(),
+                chunksize=chunksize, max_pending=2,
+            )
+            assert next(iterator) == 0
+            with pytest.raises(Exception, match='source failed'):
+                next(iterator)
+        finally:
+            pool.terminate()
+            pool.join()
+
+    @pytest.mark.parametrize('unordered', (False, True))
+    def test_imap_worker_exception_does_not_block_producer(self, unordered):
+        def source():
+            yield 0
+            yield 1
+
+        pool = billiard.pool.Pool(2)
+        try:
+            method = pool.imap_unordered if unordered else pool.imap
+            iterator = method(boom, source(), max_pending=2)
+            with pytest.raises(Exception, match='ValueError'):
+                next(iterator)
+        finally:
+            pool.terminate()
+            pool.join()
+
+    @pytest.mark.parametrize('max_pending', (0, -1, 1.5, True))
+    def test_imap_rejects_invalid_max_pending(self, max_pending):
+        pool = billiard.pool.Pool(1)
+        try:
+            with pytest.raises((TypeError, ValueError), match='max_pending'):
+                pool.imap(simple_task, range(3), max_pending=max_pending)
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_imap_iterator_releases_budget_when_result_is_consumed(self):
+        result = IMapIterator({}, max_pending=1)
+        result._reserve(1)
+        result._set_task_size(0, 1)
+        result._set_length(1)
+        result._set(0, (True, 'value'))
+        assert result.pending() == 1
+        assert result.next(timeout=1) == 'value'
+        assert result.pending() == 0
+        result.close()
+
+    def test_imap_unordered_iterator_releases_budget_when_consumed(self):
+        result = IMapUnorderedIterator({}, max_pending=1)
+        result._reserve(1)
+        result._set_task_size(0, 1)
+        result._set_length(1)
+        result._set(0, (True, 'value'))
+        assert result.pending() == 1
+        assert result.next(timeout=1) == 'value'
+        assert result.pending() == 0
+        result.close()
+
     def test_memory_error_from_callback_propagates(self):
         def callback(value):
             raise MemoryError(value)
