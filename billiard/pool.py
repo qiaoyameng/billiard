@@ -131,6 +131,18 @@ def mapstar(args):
     return list(map(*args))
 
 
+def _unpack_chunks(result):
+    # Yield individual items from an IMapIterator of chunks, making sure
+    # the underlying iterator is closed (stopping the task producer) when
+    # the consumer closes or abandons this generator.
+    try:
+        for chunk in result:
+            for item in chunk:
+                yield item
+    finally:
+        result.close()
+
+
 def starmapstar(args):
     return list(itertools.starmap(args[0], args[1]))
 
@@ -1443,49 +1455,98 @@ class Pool:
         if self._state == RUN:
             return self.map_async(func, iterable, chunksize).get()
 
-    def imap(self, func, iterable, chunksize=1, lost_worker_timeout=None):
+    def _imap_should_stop(self):
+        return (self._state != RUN or
+                self._task_handler._state != RUN)
+
+    def _imap_taskseq(self, result, iterable, func):
+        # Generate TASK tuples for imap()/imap_unordered(), pulling from
+        # ``iterable`` lazily and throttled by the result iterator's
+        # max_pending window, so that a slow consumer cannot cause
+        # unbounded prefetch of a (possibly infinite) generator.
+        should_stop = self._imap_should_stop
+        iterator = iter(iterable)
+        i = 0
+        while result._wait_for_slot(should_stop):
+            try:
+                x = next(iterator)
+            except StopIteration:
+                result._cancel_slot()
+                return
+            except BaseException:
+                result._cancel_slot()
+                raise
+            yield (TASK, (result._job, i, func, (x,), {}))
+            i += 1
+
+    @staticmethod
+    def _imap_pending_tasks(max_pending, chunksize):
+        # The max_pending budget is always expressed in input items;
+        # with chunksize > 1 it is rounded up to a whole number of
+        # chunks (tasks), so at most ceil(max_pending / chunksize)
+        # chunks are in flight at any time.
+        if max_pending is None:
+            return None
+        return max(1, -(-max_pending // chunksize))
+
+    def imap(self, func, iterable, chunksize=1, lost_worker_timeout=None,
+             max_pending=None):
         '''
         Equivalent of `map()` -- can be MUCH slower than `Pool.map()`.
+
+        If `max_pending` is given, at most that many items of `iterable`
+        are submitted while waiting to be consumed from the returned
+        iterator, allowing (infinite) generators to be consumed lazily.
+        The budget is counted in input items: with ``chunksize > 1`` it
+        is rounded up to a whole number of chunks.  Call ``close()`` on
+        the returned iterator to stop consuming the input early.
         '''
         if self._state != RUN:
             return
+        if max_pending is not None and max_pending < 1:
+            raise ValueError('max_pending must be a positive integer')
         lost_worker_timeout = lost_worker_timeout or self.lost_worker_timeout
         if chunksize == 1:
             result = IMapIterator(self._cache,
-                                  lost_worker_timeout=lost_worker_timeout)
+                                  lost_worker_timeout=lost_worker_timeout,
+                                  max_pending=max_pending)
             self._taskqueue.put((
-                ((TASK, (result._job, i, func, (x,), {}))
-                 for i, x in enumerate(iterable)),
+                self._imap_taskseq(result, iterable, func),
                 result._set_length,
             ))
             return result
         else:
             assert chunksize > 1
             task_batches = Pool._get_tasks(func, iterable, chunksize)
-            result = IMapIterator(self._cache,
-                                  lost_worker_timeout=lost_worker_timeout)
+            result = IMapIterator(
+                self._cache, lost_worker_timeout=lost_worker_timeout,
+                max_pending=self._imap_pending_tasks(max_pending, chunksize),
+            )
             self._taskqueue.put((
-                ((TASK, (result._job, i, mapstar, (x,), {}))
-                 for i, x in enumerate(task_batches)),
+                self._imap_taskseq(result, task_batches, mapstar),
                 result._set_length,
             ))
-            return (item for chunk in result for item in chunk)
+            return _unpack_chunks(result)
 
     def imap_unordered(self, func, iterable, chunksize=1,
-                       lost_worker_timeout=None):
+                       lost_worker_timeout=None, max_pending=None):
         '''
         Like `imap()` method but ordering of results is arbitrary.
+
+        See `imap()` for the meaning of `max_pending`.
         '''
         if self._state != RUN:
             return
+        if max_pending is not None and max_pending < 1:
+            raise ValueError('max_pending must be a positive integer')
         lost_worker_timeout = lost_worker_timeout or self.lost_worker_timeout
         if chunksize == 1:
             result = IMapUnorderedIterator(
                 self._cache, lost_worker_timeout=lost_worker_timeout,
+                max_pending=max_pending,
             )
             self._taskqueue.put((
-                ((TASK, (result._job, i, func, (x,), {}))
-                 for i, x in enumerate(iterable)),
+                self._imap_taskseq(result, iterable, func),
                 result._set_length,
             ))
             return result
@@ -1494,13 +1555,13 @@ class Pool:
             task_batches = Pool._get_tasks(func, iterable, chunksize)
             result = IMapUnorderedIterator(
                 self._cache, lost_worker_timeout=lost_worker_timeout,
+                max_pending=self._imap_pending_tasks(max_pending, chunksize),
             )
             self._taskqueue.put((
-                ((TASK, (result._job, i, mapstar, (x,), {}))
-                 for i, x in enumerate(task_batches)),
+                self._imap_taskseq(result, task_batches, mapstar),
                 result._set_length,
             ))
-            return (item for chunk in result for item in chunk)
+            return _unpack_chunks(result)
 
     def apply_async(self, func, args=(), kwds={},
                     callback=None, error_callback=None, accept_callback=None,
@@ -1960,8 +2021,13 @@ class MapResult(ApplyResult):
 class IMapIterator:
     _worker_lost = None
 
-    def __init__(self, cache, lost_worker_timeout=LOST_WORKER_TIMEOUT):
-        self._cond = threading.Condition(threading.Lock())
+    def __init__(self, cache, lost_worker_timeout=LOST_WORKER_TIMEOUT,
+                 max_pending=None):
+        self._mutex = threading.Lock()
+        self._cond = threading.Condition(self._mutex)
+        # producer-side condition (shares the mutex with _cond) used to
+        # throttle submission within the max_pending window.
+        self._slots_cond = threading.Condition(self._mutex)
         self._job = next(job_counter)
         self._cache = cache
         self._items = deque()
@@ -1971,6 +2037,10 @@ class IMapIterator:
         self._unsorted = {}
         self._worker_pids = []
         self._lost_worker_timeout = lost_worker_timeout
+        self._max_pending = max_pending
+        self._pending = 0
+        self._closed = False
+        self._failed = False
         cache[self._job] = self
 
     def __iter__(self):
@@ -1992,6 +2062,7 @@ class IMapIterator:
                         self._ready = True
                         raise StopIteration
                     raise TimeoutError
+            self._release_slot()
 
         success, value = item
         if success:
@@ -2000,8 +2071,73 @@ class IMapIterator:
 
     __next__ = next                    # XXX
 
+    def _wait_for_slot(self, should_stop=None):
+        # Reserve a slot in the max_pending window, blocking while the
+        # number of submitted-but-unconsumed items reached the limit.
+        # Returns False when submission must stop because the iterator
+        # was closed, a worker error was recorded, or should_stop() is
+        # true (e.g. the pool is shutting down).
+        with self._slots_cond:
+            while not self._closed:
+                if self._max_pending is None:
+                    self._pending += 1
+                    return True
+                if self._failed:
+                    return False
+                if self._pending < self._max_pending:
+                    self._pending += 1
+                    return True
+                if should_stop is not None and should_stop():
+                    return False
+                self._slots_cond.wait(0.1)
+            return False
+
+    def _cancel_slot(self):
+        # Take back a slot reserved by _wait_for_slot() when the input
+        # iterable was exhausted or raised before the task was submitted.
+        with self._slots_cond:
+            if self._pending > 0:
+                self._pending -= 1
+
+    def _release_slot(self):
+        # called with self._cond held after an item was consumed.
+        if self._pending > 0:
+            self._pending -= 1
+            self._slots_cond.notify_all()
+
+    def close(self):
+        # Close the iterator early: the task producer stops pulling from
+        # the input iterable and results arriving later are discarded.
+        with self._cond:
+            if self._closed:
+                return
+            self._closed = True
+            self._cache.pop(self._job, None)
+            self._cond.notify_all()
+            self._slots_cond.notify_all()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _set(self, i, obj):
         with self._cond:
+            if self._closed:
+                return
+            if not obj[0]:
+                # worker error: release a throttled producer so it cannot
+                # block forever waiting for slots that will never be
+                # released by a consumer.
+                self._failed = True
+                self._slots_cond.notify_all()
             if self._index == i:
                 self._items.append(obj)
                 self._index += 1
@@ -2019,6 +2155,8 @@ class IMapIterator:
 
     def _set_length(self, length):
         with self._cond:
+            if self._closed:
+                return
             self._length = length
             if self._index == self._length:
                 self._ready = True
@@ -2043,6 +2181,12 @@ class IMapUnorderedIterator(IMapIterator):
 
     def _set(self, i, obj):
         with self._cond:
+            if self._closed:
+                return
+            if not obj[0]:
+                # see IMapIterator._set
+                self._failed = True
+                self._slots_cond.notify_all()
             self._items.append(obj)
             self._index += 1
             self._cond.notify()
