@@ -41,6 +41,7 @@ from .exceptions import (
     TimeoutError,
     WorkerLostError,
 )
+from .reduction import ForkingPickler
 from time import monotonic
 from queue import Queue, Empty
 from .util import Finalize, debug, warning
@@ -91,6 +92,7 @@ READY = 1
 TASK = 2
 NACK = 3
 DEATH = 4
+WORKER_READY = 5
 
 #
 # Exit code constants
@@ -237,7 +239,9 @@ class Worker:
     def __init__(self, inq, outq, synq=None, initializer=None, initargs=(),
                  maxtasks=None, sentinel=None, on_exit=None,
                  sigprotection=True, wrap_exception=True,
-                 max_memory_per_child=None, on_ready_counter=None):
+                 max_memory_per_child=None, on_ready_counter=None,
+                 admission=None, ready=None, generation=0,
+                 control_queue=None):
         assert maxtasks is None or (type(maxtasks) == int and maxtasks > 0)
         self.initializer = initializer
         self.initargs = initargs
@@ -247,8 +251,15 @@ class Worker:
         self.on_exit = on_exit
         self.sigprotection = sigprotection
         self.inq, self.outq, self.synq = inq, outq, synq
+        self.controlq = control_queue
+        self.requeue_fd = None
+        if hasattr(os, 'dup') and hasattr(self.inq, '_writer'):
+            self.requeue_fd = os.dup(self.inq._writer.fileno())
         self.wrap_exception = wrap_exception  # XXX cannot disable yet
         self.on_ready_counter = on_ready_counter
+        self._admission = admission
+        self._ready = ready
+        self._generation = generation
         self.contribute_to_object(self)
 
     def contribute_to_object(self, obj):
@@ -263,6 +274,7 @@ class Worker:
             obj.synqR_fd = obj.synqW_fd = obj._send_syn_offset = None
         obj._quick_put = self.inq._writer.send
         obj._quick_get = self.outq._reader.recv
+        obj.requeue_fd = self.requeue_fd
         obj.send_job_offset = _get_send_offset(self.inq._writer)
         return obj
 
@@ -271,7 +283,8 @@ class Worker:
             self.inq, self.outq, self.synq, self.initializer,
             self.initargs, self.maxtasks, self._shutdown, self.on_exit,
             self.sigprotection, self.wrap_exception, self.max_memory_per_child,
-            self.on_ready_counter
+            self.on_ready_counter, self._admission, self._ready,
+            self._generation, self.controlq
         )
 
     def __call__(self):
@@ -287,14 +300,26 @@ class Worker:
 
         self._make_child_methods()
         self.after_fork()
+        put = self.outq.put
+        if self._ready is not None:
+            self._ready.set()
+        put((WORKER_READY, (pid, self._generation)))
+        if self._admission is not None:
+            while not self._admission.is_set():
+                if self._control_drain_requested():
+                    raise SystemExit(EX_OK)
+                if self._shutdown is not None and self._shutdown.is_set():
+                    raise SystemExit(EX_OK)
+                self._admission.wait(1.0)
         self.on_loop_start(pid=pid)  # callback on loop start
+        exc_info = None
         try:
             sys.exit(self.workloop(pid=pid))
         except Exception as exc:
+            exc_info = exc
             error('Pool process %r error: %r', self, exc, exc_info=1)
-            self._do_exit(pid, _exitcode[0], exc)
         finally:
-            self._do_exit(pid, _exitcode[0], None)
+            self._do_exit(pid, _exitcode[0], exc_info)
 
     def _do_exit(self, pid, exitcode, exc=None):
         if exitcode is None:
@@ -314,6 +339,15 @@ class Worker:
 
     def on_loop_start(self, pid):
         pass
+
+    def _control_drain_requested(self):
+        if self.controlq is None:
+            return self._shutdown is not None and self._shutdown.is_set()
+        reader = self.controlq._reader
+        if reader.poll():
+            reader.recv()
+            return True
+        return False
 
     def prepare_result(self, result):
         return result
@@ -422,6 +456,9 @@ class Worker:
     def after_fork(self):
         if hasattr(self.inq, '_writer'):
             self.inq._writer.close()
+        if self.controlq is not None:
+            if hasattr(self.controlq, '_writer'):
+                self.controlq._writer.close()
         if hasattr(self.outq, '_reader'):
             self.outq._reader.close()
 
@@ -465,20 +502,57 @@ class Worker:
         return _recv
 
     def _make_child_methods(self, loads=pickle_loads):
-        self.wait_for_job = self._make_protected_receive(self.inq)
+        wait_for_control = self._make_control_receive()
+        self.wait_for_job = self._make_protected_receive(
+            self.inq, self._requeue_task, wait_for_control,
+        )
         self.wait_for_syn = (self._make_protected_receive(self.synq)
                              if self.synq else None)
 
-    def _make_protected_receive(self, conn):
+    def _make_control_receive(self):
+        if self.controlq is None:
+            should_shutdown = (
+                self._shutdown.is_set if self._shutdown is not None else None
+            )
+
+            def receive():
+                return bool(should_shutdown and should_shutdown())
+
+            return receive
+        reader = self.controlq._reader
+
+        def receive():
+            if reader.poll():
+                reader.recv()
+                return True
+            return self._shutdown is not None and self._shutdown.is_set()
+
+        return receive
+
+    def _requeue_task(self, task):
+        self.outq.put((REQUEUE_TASK, task))
+
+    def _make_protected_receive(self, conn, requeue=None,
+                                wait_for_control=None):
         _receive = self._make_recv_method(conn)
         should_shutdown = self._shutdown.is_set if self._shutdown else None
+        requeue = requeue or self.inq.put
+        wait_for_control = wait_for_control or (lambda: False)
 
         def receive(debug=debug):
-            if should_shutdown and should_shutdown():
-                debug('worker got sentinel -- exiting')
-                raise SystemExit(EX_OK)
             try:
+                if wait_for_control():
+                    debug('worker got drain command')
+                    raise SystemExit(EX_OK)
                 ready, req = _receive(1.0)
+                if not ready:
+                    req = None
+                if wait_for_control() or (
+                        should_shutdown and should_shutdown()):
+                    if req is not None:
+                        requeue(req)
+                    debug('worker got sentinel -- exiting')
+                    raise SystemExit(EX_OK)
                 if not ready:
                     return None
             except (EOFError, IOError) as exc:
@@ -787,7 +861,8 @@ class ResultHandler(PoolThread):
 
     def __init__(self, outqueue, get, cache, poll,
                  join_exited_workers, putlock, restart_state,
-                 check_timeouts, on_job_ready, on_ready_counters=None):
+                 check_timeouts, on_job_ready, on_ready_counters=None,
+                 on_worker_ready=None):
         self.outqueue = outqueue
         self.get = get
         self.cache = cache
@@ -799,6 +874,7 @@ class ResultHandler(PoolThread):
         self._shutdown_complete = False
         self.check_timeouts = check_timeouts
         self.on_job_ready = on_job_ready
+        self.on_worker_ready = on_worker_ready
         self.on_ready_counters = on_ready_counters
         self._make_methods()
         super().__init__()
@@ -812,6 +888,7 @@ class ResultHandler(PoolThread):
         putlock = self.putlock
         restart_state = self.restart_state
         on_job_ready = self.on_job_ready
+        on_worker_ready = self.on_worker_ready
 
         def on_ack(job, i, time_accepted, pid, synqW_fd):
             restart_state.R = 0
@@ -851,8 +928,15 @@ class ResultHandler(PoolThread):
                 if get_errno(exc) != errno.ESRCH:
                     raise
 
+        def on_worker_ready_message(pid, generation):
+            if on_worker_ready is not None:
+                on_worker_ready(pid, generation)
+
         state_handlers = self.state_handlers = {
-            ACK: on_ack, READY: on_ready, DEATH: on_death
+            ACK: on_ack,
+            READY: on_ready,
+            DEATH: on_death,
+            WORKER_READY: on_worker_ready_message,
         }
 
         def on_state_change(task):
@@ -1041,6 +1125,15 @@ class Pool:
         self.threads = threads
         self.readers = {}
         self.allow_restart = allow_restart
+        self._pool_mutex = threading.RLock()
+        self._generation = 0
+        self._recycle_generation = None
+        self._recycle_max_concurrency = None
+        self._recycle_inflight = {}
+        self._recycle_draining = set()
+        self._pending_workers = []
+        self._recycle_slot_ids = itertools.count()
+        self._control_queues = {}
 
         self.enable_timeouts = bool(
             enable_timeouts or
@@ -1073,7 +1166,7 @@ class Pool:
         self.putlocks = putlocks
         self._putlock = semaphore or LaxBoundedSemaphore(self._processes)
         for i in range(self._processes):
-            self._create_worker_process(i)
+            self._create_worker_process(i, generation=0)
 
         self._worker_handler = self.Supervisor(self)
         if threads:
@@ -1136,11 +1229,23 @@ class Pool:
             self._poll_result, self._join_exited_workers,
             self._putlock, self.restart_state, self.check_timeouts,
             self.on_job_ready, on_ready_counters=self._on_ready_counters,
+            on_worker_ready=self._on_worker_ready,
             **extra_kwargs
         )
 
     def on_job_ready(self, job, i, obj, inqW_fd):
         pass
+
+    def _on_worker_ready(self, pid, generation):
+        with self._pool_mutex:
+            pending = None
+            for candidate in self._pending_workers:
+                if candidate['worker'].pid == pid:
+                    pending = candidate
+                    break
+            if pending is not None and not pending['admission'].is_set():
+                pending['ready'].set()
+                self._admit_pending_worker(pending)
 
     def _help_stuff_finish_args(self):
         return self._inqueue, self._task_handler, self._pool
@@ -1166,8 +1271,12 @@ class Pool:
     def get_process_queues(self):
         return self._inqueue, self._outqueue, None
 
-    def _create_worker_process(self, i):
-        sentinel = self._ctx.Event() if self.allow_restart else None
+    def _create_worker_process(
+            self, i, generation=0, admission=None, shutdown=None,
+            ready=None, recycle_slot=None, control_queue=None):
+        sentinel = shutdown if shutdown is not None else self._ctx.Event()
+        if control_queue is None:
+            control_queue = self._ctx.SimpleQueue()
         inq, outq, synq = self.get_process_queues()
         on_ready_counter = self._ctx.Value('i')
         w = self.WorkerProcess(self.Worker(
@@ -1179,23 +1288,318 @@ class Pool:
             wrap_exception=self._wrap_exception,
             max_memory_per_child=self._max_memory_per_child,
             on_ready_counter=on_ready_counter,
+            admission=admission,
+            ready=ready,
+            generation=generation,
+            control_queue=control_queue,
         ))
         self._pool.append(w)
         self._process_register_queues(w, (inq, outq, synq))
         w.name = w.name.replace('Process', 'PoolWorker')
         w.daemon = True
         w.index = i
+        w.generation = generation
+        w._recycle_slot = recycle_slot
         w.start()
         self._poolctrl[w.pid] = sentinel
+        self._control_queues[w.pid] = control_queue
         self._on_ready_counters[w.pid] = on_ready_counter
+        if recycle_slot is not None:
+            self._recycle_inflight.setdefault(recycle_slot, {
+                'new_pid': w.pid,
+                'draining': False,
+            })
+            self._recycle_inflight[recycle_slot]['new_pid'] = w.pid
+            self._recycle_inflight[recycle_slot]['shutdown'] = sentinel
+        if ready is not None and admission is not None:
+            pending = {
+                'worker': w,
+                'ready': ready,
+                'admission': admission,
+                'recycle_slot': recycle_slot,
+            }
+            self._pending_workers.append(pending)
+            if ready.is_set():
+                self._admit_pending_worker(pending)
         if self.on_process_up:
             self.on_process_up(w)
         return w
+
+    def _admit_pending_worker(self, pending):
+        if pending in self._pending_workers:
+            self._pending_workers.remove(pending)
+        pending['admission'].set()
+        slot = pending.get('recycle_slot')
+        if slot is not None and slot in self._recycle_inflight:
+            self._recycle_inflight[slot]['admitted'] = True
+        if pending['recycle_slot'] is not None:
+            self._drain_recycle_old_worker(pending['recycle_slot'])
+
+    def _drain_recycle_old_worker(self, slot):
+        state = self._recycle_inflight.get(slot)
+        if state is None or state.get('draining'):
+            return
+        state['admitted'] = True
+        state['draining'] = True
+        old_pid = state['old_pid']
+        sentinel = self._poolctrl.get(old_pid)
+        if sentinel is None:
+            state['old_dead'] = True
+            return
+        self._recycle_draining.add(old_pid)
+        control_queue = self._control_queues.get(old_pid)
+        if control_queue is not None:
+            control_queue.put(1)
+        elif sentinel is not None:
+            sentinel.set()
+
+    def _active_recycle_slots(self):
+        return set(self._recycle_inflight)
+
+    def _worker_recycle_slot(self, worker):
+        slot = getattr(worker, '_recycle_slot', None)
+        if slot is None or slot not in self._recycle_inflight:
+            return None
+        return slot
+
+    def _recycle_capacity(self):
+        capacity = 0
+        active_slots = self._active_recycle_slots()
+        slotted_pending = set()
+        for worker in self._pool:
+            slot = self._worker_recycle_slot(worker)
+            if slot is None:
+                capacity += 1
+                continue
+            state = self._recycle_inflight[slot]
+            if worker.pid == state['new_pid']:
+                if state.get('admitted'):
+                    capacity += 1
+            elif worker.pid == state['old_pid'] and not state.get('draining'):
+                capacity += 1
+        for pending in self._pending_workers:
+            worker = pending['worker']
+            slot = pending.get('recycle_slot')
+            if slot is None and worker.exitcode is None:
+                capacity += 1
+            elif slot is not None:
+                slotted_pending.add(worker.pid)
+        for slot in active_slots:
+            state = self._recycle_inflight[slot]
+            old_present = any(w.pid == state['old_pid'] for w in self._pool)
+            new_present = any(w.pid == state['new_pid'] for w in self._pool)
+            if not old_present and not new_present:
+                continue
+            if not old_present and not state.get('admitted'):
+                capacity += 1
+        return capacity
+
+    def _resolve_pending_workers(self):
+        for pending in list(self._pending_workers):
+            worker = pending['worker']
+            if pending['ready'].is_set():
+                self._admit_pending_worker(pending)
+                continue
+            if worker._popen is None or worker.exitcode is not None:
+                self._pending_workers.remove(pending)
+                slot = pending.get('recycle_slot')
+                if slot is not None and slot in self._recycle_inflight:
+                    state = self._recycle_inflight[slot]
+                    state['new_dead'] = True
+                    state['last_exit'] = worker.exitcode
+
+    def _handle_exited_recycle_worker(self, worker, exitcode):
+        slot = self._worker_recycle_slot(worker)
+        if slot is not None:
+            state = self._recycle_inflight[slot]
+            if worker.pid == state['new_pid']:
+                state['new_dead'] = True
+                state['last_exit'] = exitcode
+            elif worker.pid == state['old_pid']:
+                state['old_dead'] = True
+                state['old_exit'] = exitcode
+                self._recycle_draining.discard(worker.pid)
+            return
+
+        for state in self._recycle_inflight.values():
+            if worker.pid == state['old_pid']:
+                state['old_dead'] = True
+                state['old_exit'] = exitcode
+                self._recycle_draining.discard(worker.pid)
+                return
+
+    def _finish_recycle_slots(self):
+        for slot in list(self._recycle_inflight):
+            state = self._recycle_inflight[slot]
+            old_alive = any(
+                w.pid == state['old_pid'] and w.exitcode is None
+                for w in self._pool
+            )
+            new_alive = any(
+                w.pid == state['new_pid'] and w.exitcode is None
+                for w in self._pool
+            )
+            if not old_alive:
+                state['old_dead'] = True
+            if state.get('new_dead') and not state.get('admitted'):
+                if not old_alive:
+                    del self._recycle_inflight[slot]
+                continue
+            if state.get('old_dead') and state.get('admitted'):
+                del self._recycle_inflight[slot]
+
+    def _restart_failed_recycle_worker(self):
+        for slot, state in list(self._recycle_inflight.items()):
+            if not state.get('new_dead'):
+                continue
+            if state.get('old_dead'):
+                continue
+            exitcode = state.get('last_exit')
+            if exitcode not in (EX_OK, EX_RECYCLE):
+                self.restart_state.step()
+            self._start_recycle_worker(
+                slot, state['index'], self._recycle_generation,
+                state['old_pid'],
+            )
+            state['new_dead'] = False
+
+    def _start_recycle_worker(self, slot, index, generation, old_pid):
+        state = self._recycle_inflight.setdefault(slot, {
+            'old_pid': old_pid,
+            'new_pid': None,
+            'index': index,
+            'admitted': False,
+            'draining': False,
+            'old_dead': False,
+            'new_dead': False,
+        })
+        state['new_dead'] = False
+        ready = self._ctx.Event()
+        admission = self._ctx.Event()
+        worker = self._create_worker_process(
+            index,
+            generation=generation,
+            ready=ready,
+            admission=admission,
+            shutdown=None,
+            recycle_slot=slot,
+        )
+        state['new_pid'] = worker.pid
+
+    def _start_recycle_workers(self):
+        if self._recycle_generation is None:
+            return
+        target = self._recycle_generation
+        active = self._active_recycle_slots()
+        active_old_pids = {
+            state['old_pid'] for state in self._recycle_inflight.values()
+        }
+        pending_pids = {
+            pending['worker'].pid for pending in self._pending_workers
+            if pending['worker'].pid is not None
+        }
+        draining = self._recycle_draining
+        candidates = [
+            worker for worker in list(self._pool)
+            if getattr(worker, 'generation', 0) < target
+            and worker.pid not in active_old_pids
+            and worker.pid not in pending_pids
+            and worker.pid not in draining
+            and worker.exitcode is None
+        ]
+        limit = self._recycle_max_concurrency or 1
+        available = max(0, limit - len(active))
+        ordered_candidates = sorted(
+            candidates,
+            key=lambda worker: self._worker_active(worker),
+        )
+        for old_worker in ordered_candidates[:available]:
+            slot = next(self._recycle_slot_ids)
+            state = self._recycle_inflight[slot] = {
+                'old_pid': old_worker.pid,
+                'new_pid': None,
+                'index': old_worker.index,
+                'shutdown': self._poolctrl[old_worker.pid],
+                'admitted': False,
+                'draining': False,
+                'old_dead': False,
+                'new_dead': False,
+            }
+            ready = self._ctx.Event()
+            admission = self._ctx.Event()
+            self._create_worker_process(
+                old_worker.index,
+                generation=self._effective_worker_generation(target),
+                ready=ready,
+                admission=admission,
+                shutdown=None,
+                recycle_slot=slot,
+            )
+
+    def _effective_worker_generation(self, target=None):
+        return target if target is not None else (
+            self._recycle_generation
+            if self._recycle_generation is not None else self._generation
+        )
+
+    def rolling_recycle(self, concurrency=1):
+        if isinstance(concurrency, bool):
+            raise TypeError("concurrency must be an int, not bool")
+        if not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("concurrency must be a positive integer")
+        if concurrency > self._processes:
+            raise ValueError(
+                "concurrency cannot exceed the number of pool processes",
+            )
+        if self._state != RUN:
+            raise RuntimeError("pool is not running")
+        with self._pool_mutex:
+            target = (
+                self._recycle_generation + 1
+                if self._recycle_generation is not None
+                else self._generation + 1
+            )
+            self._recycle_generation = target
+            if self._recycle_max_concurrency is None:
+                self._recycle_max_concurrency = concurrency
+            else:
+                self._recycle_max_concurrency = max(
+                    self._recycle_max_concurrency, concurrency,
+                )
+        self.maintain_pool()
+        return target
+
+    recycle = rolling_recycle
+
+    @property
+    def generation(self):
+        return (
+            self._recycle_generation
+            if self._recycle_generation is not None
+            else self._generation
+        )
+
+    def _maintain_recycles(self):
+        if self._recycle_generation is None:
+            return
+        self._finish_recycle_slots()
+        self._restart_failed_recycle_worker()
+        self._finish_recycle_slots()
+        self._start_recycle_workers()
+        if not self._recycle_inflight:
+            self._generation = self._recycle_generation
+            self._recycle_generation = None
+            self._recycle_max_concurrency = None
 
     def process_flush_queues(self, worker):
         pass
 
     def _join_exited_workers(self, shutdown=False):
+        with self._pool_mutex:
+            self._resolve_pending_workers()
+            return self._join_exited_workers_unlocked(shutdown)
+
+    def _join_exited_workers_unlocked(self, shutdown=False):
         """Cleanup after any worker processes which have exited due to
         reaching their specified lifetime. Returns True if any workers were
         cleaned up.
@@ -1228,6 +1632,11 @@ class Pool:
                 debug('Supervisor: worked %d joined', i)
                 cleaned[worker.pid] = worker
                 exitcodes[worker.pid] = exitcode
+                self._pending_workers = [
+                    pending for pending in self._pending_workers
+                    if pending['worker'] is not worker
+                ]
+                self._handle_exited_recycle_worker(worker, exitcode)
                 if exitcode not in (EX_OK, EX_RECYCLE) and \
                         not getattr(worker, '_controlled_termination', False):
                     error(
@@ -1238,6 +1647,12 @@ class Pool:
                 self.process_flush_queues(worker)
                 del self._pool[i]
                 del self._poolctrl[worker.pid]
+                control_queue = self._control_queues.pop(worker.pid, None)
+                if control_queue is not None:
+                    if control_queue._reader is not None:
+                        control_queue._reader.close()
+                    if control_queue._writer is not None:
+                        control_queue._writer.close()
                 del self._on_ready_counters[worker.pid]
         if cleaned:
             all_pids = [w.pid for w in self._pool]
@@ -1347,7 +1762,8 @@ class Pool:
         """Bring the number of pool processes up to the specified number,
         for use after reaping workers which have exited.
         """
-        for i in range(self._processes - len(self._pool)):
+        deficit = self._processes - self._recycle_capacity()
+        for i in range(deficit):
             if self._state != RUN:
                 return
             try:
@@ -1355,7 +1771,10 @@ class Pool:
                     self.restart_state.step()
             except IndexError:
                 self.restart_state.step()
-            self._create_worker_process(self._avail_index())
+            self._create_worker_process(
+                self._avail_index(),
+                generation=self._generation,
+            )
             debug('added worker')
 
     def _avail_index(self):
@@ -1369,8 +1788,11 @@ class Pool:
     def _maintain_pool(self):
         """"Clean up any exited workers and start replacements for them.
         """
-        joined = self._join_exited_workers()
-        self._repopulate_pool(joined)
+        with self._pool_mutex:
+            joined = self._join_exited_workers_unlocked()
+            self._maintain_recycles()
+            self._repopulate_pool(joined)
+            self._resolve_pending_workers()
         for i in range(len(joined)):
             if self._putlock is not None:
                 self._putlock.release()
@@ -1624,6 +2046,14 @@ class Pool:
         debug('closing pool')
         if self._state == RUN:
             self._state = CLOSE
+            with self._pool_mutex:
+                for pending in self._pending_workers:
+                    pending['admission'].set()
+                self._pending_workers.clear()
+                self._recycle_generation = None
+                self._recycle_max_concurrency = None
+                self._recycle_inflight.clear()
+                self._recycle_draining.clear()
             if self._putlock:
                 self._putlock.clear()
             self._worker_handler.close()
@@ -1633,6 +2063,14 @@ class Pool:
     def terminate(self):
         debug('terminating pool')
         self._state = TERMINATE
+        with self._pool_mutex:
+            for pending in self._pending_workers:
+                pending['admission'].set()
+            self._pending_workers.clear()
+            self._recycle_generation = None
+            self._recycle_max_concurrency = None
+            self._recycle_inflight.clear()
+            self._recycle_draining.clear()
         self._worker_handler.terminate()
         self._terminate()
 
@@ -1656,6 +2094,12 @@ class Pool:
         debug('pool join complete')
 
     def restart(self):
+        if self._recycle_generation is not None:
+            self._recycle_generation += 1
+        else:
+            self._generation += 1
+            self._recycle_generation = self._generation
+        self._recycle_max_concurrency = self._processes
         for e in self._poolctrl.values():
             e.set()
 

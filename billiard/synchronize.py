@@ -363,7 +363,6 @@ class Event:
 
     def set(self):
         with self._cond:
-            self._flag.acquire(False)
             self._flag.release()
             self._cond.notify_all()
 
