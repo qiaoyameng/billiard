@@ -63,6 +63,38 @@ additional bug fixes and improvements.
 
 .. _`Celery`: http://celeryproject.org
 
+Shared byte blocks
+------------------
+
+When the same large read-only payload is needed by many pool tasks,
+``Pool.shared_bytes()`` lets the parent process create and own a shared
+byte block instead of copying the payload through the task pipe for
+every task::
+
+    pool = billiard.Pool(4)
+    block = pool.shared_bytes(large_payload)
+    results = [pool.apply_async(consume, (i,), shared=(block,))
+               for i in range(100)]
+    block.close()  # release the user handle; in-flight tasks still finish
+
+Each task submitted with ``shared=(block,)`` receives a read-only
+``billiard.sharedbytes.SharedBytesView`` appended to its positional
+arguments, while only a small handle (segment name plus an unforgeable
+generational identity) travels through the pipe.  References held by a
+task are returned when the task finishes, is cancelled, fails to
+serialize, or its worker is lost; the segment is unlinked only after
+the user handle and all in-flight task references are released.
+
+Only payloads explicitly registered with ``Pool.shared_bytes()`` and
+passed via the ``shared`` parameter are transferred this way; arbitrary
+task arguments are never scanned or rewritten.
+
+Shared blocks require Python >= 3.8 (``multiprocessing.shared_memory``).
+They work on POSIX with the ``fork``, ``spawn`` and ``forkserver``
+start methods, and on Windows with ``spawn``: workers always attach to
+the segment by name and never rely on inheriting the parent's address
+space.  See ``billiard.sharedbytes`` for details.
+
 Documentation
 -------------
 
