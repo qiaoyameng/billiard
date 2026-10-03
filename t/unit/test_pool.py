@@ -1,12 +1,14 @@
 import os
 import signal
+import threading
 import time
 
 import pytest
 
 import billiard.pool
 from billiard import get_context
-from billiard.exceptions import TimeLimitExceeded
+from billiard.exceptions import Cancelled, TimeLimitExceeded
+from queue import Empty
 
 
 def func(x):
@@ -30,6 +32,267 @@ def raise_base_exception():
 def raise_system_exit():
     raise SystemExit(1)
 
+# -- helpers for the cancel() tests -------------------------------------
+
+# Per-worker fixture registry, installed by _lab_init in each worker.
+_LAB = {}
+
+
+def _lab_init(started, release, executed):
+    _LAB['started'] = started
+    _LAB['release'] = release
+    _LAB['executed'] = executed
+
+
+def _lab_blocking_task(name):
+    # Signal that the function started, wait for the parent's release
+    # event, then record that it executed.
+    _LAB['started'].set()
+    _LAB['release'].wait(30)
+    _LAB['executed'].put(name)
+    return name
+
+
+def _lab_quick_task(name):
+    # Record execution immediately: used to prove a task did (not) run.
+    _LAB['executed'].put(name)
+    return name
+
+
+def _lab_sleep_task(name):
+    # Signal start, then keep the worker busy without holding any
+    # shared locks, so the worker can be killed safely mid-task.
+    _LAB['started'].set()
+    time.sleep(30)
+    return name
+
+
+def _lab_pool(ctx, synack=False, **kwargs):
+    started, release, executed = ctx.Event(), ctx.Event(), ctx.Queue()
+    pool = billiard.pool.Pool(
+        processes=1, synack=synack, context=ctx,
+        initializer=_lab_init, initargs=(started, release, executed),
+        **kwargs)
+    return pool, started, release, executed
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='requires fork')
+class test_cancel:
+    """Tests for the public ApplyResult.cancel()/MapResult.cancel() API.
+
+    Inter-process events are used to pin tasks at exact lifecycle
+    boundaries (dispatched, received, started) instead of relying on
+    fixed sleeps.
+    """
+
+    def setup_method(self):
+        self.ctx = get_context('fork')
+
+    def test_cancel_waiting_task_never_executes(self):
+        # cancel wins the race against a queued (dispatched but not yet
+        # received) task: the function is guaranteed to never run.
+        pool, started, release, executed = _lab_pool(self.ctx, synack=True)
+        try:
+            blocker = pool.apply_async(_lab_blocking_task, ('blocker',))
+            assert started.wait(10)
+            victim = pool.apply_async(_lab_quick_task, ('victim',))
+            assert victim.cancel() is True
+            assert victim.cancel() is True  # idempotent
+            assert victim.state == billiard.pool.ApplyResult.CANCELLED
+            release.set()
+            # the worker must receive (and discard) the victim before it
+            # can run the sentinel, so a completed sentinel proves the
+            # victim was skipped.
+            sentinel = pool.apply_async(_lab_quick_task, ('sentinel',))
+            assert sentinel.get(10) == 'sentinel'
+            with pytest.raises(Cancelled):
+                victim.get(10)
+            assert victim.ready()
+            assert not victim.successful()
+            assert blocker.get(10) == 'blocker'
+            assert executed.get(10) == 'blocker'
+            assert executed.get(10) == 'sentinel'
+            with pytest.raises(Empty):
+                executed.get_nowait()
+        finally:
+            release.set()
+            pool.terminate()
+            pool.join()
+
+    def test_cancel_racing_ack_at_receive_boundary(self):
+        # The accept callback pins the job at the receive boundary: the
+        # worker has received the task but is still waiting for the
+        # go-ahead.  Cancelling there must NACK the worker.
+        pool, started, release, executed = _lab_pool(self.ctx, synack=True)
+        acked = threading.Event()
+        goahead = threading.Event()
+
+        def on_accept(pid, time_accepted):
+            acked.set()
+            goahead.wait(30)
+
+        try:
+            victim = pool.apply_async(
+                _lab_quick_task, ('victim',), accept_callback=on_accept)
+            assert acked.wait(10)
+            assert victim.state == billiard.pool.ApplyResult.ACKED
+            assert victim.cancel() is True
+            goahead.set()
+            with pytest.raises(Cancelled):
+                victim.get(10)
+            # the pool is still usable and the victim never ran.
+            sentinel = pool.apply_async(_lab_quick_task, ('sentinel',))
+            assert sentinel.get(10) == 'sentinel'
+            assert executed.get(10) == 'sentinel'
+            with pytest.raises(Empty):
+                executed.get_nowait()
+        finally:
+            goahead.set()
+            pool.terminate()
+            pool.join()
+
+    def test_cancel_after_function_started_fails(self):
+        # cancel loses the race once the function started: it returns
+        # False and the task runs to completion (worker not killed).
+        pool, started, release, executed = _lab_pool(self.ctx)
+        try:
+            result = pool.apply_async(_lab_blocking_task, ('running',))
+            assert started.wait(10)
+            assert result.state == billiard.pool.ApplyResult.RUNNING
+            assert result.cancel() is False
+            release.set()
+            assert result.get(10) == 'running'
+            assert result.state == billiard.pool.ApplyResult.READY
+            assert result.successful()
+            # the worker was not killed by the failed cancel.
+            assert pool.apply_async(os.getpid).get(10) == \
+                result.worker_pids()[0]
+        finally:
+            release.set()
+            pool.terminate()
+            pool.join()
+
+    def test_cancel_dispatched_task_without_synack_fails(self):
+        # Without synack a task already handed to the work queue cannot
+        # be recalled: cancel() returns False and the task executes.
+        pool, started, release, executed = _lab_pool(self.ctx)
+        try:
+            blocker = pool.apply_async(_lab_blocking_task, ('blocker',))
+            assert started.wait(10)
+            victim = pool.apply_async(_lab_quick_task, ('victim',))
+            # wait until the task was written to the work queue.
+            deadline = time.monotonic() + 10
+            while victim.state == billiard.pool.ApplyResult.PENDING:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            assert victim.state == billiard.pool.ApplyResult.DISPATCHED
+            assert victim.cancel() is False
+            release.set()
+            assert victim.get(10) == 'victim'
+            assert blocker.get(10) == 'blocker'
+        finally:
+            release.set()
+            pool.terminate()
+            pool.join()
+
+    def test_cancel_finished_task_fails(self):
+        pool = billiard.pool.Pool(1)
+        try:
+            result = pool.apply_async(simple_task, (21,))
+            assert result.get(10) == 42
+            assert result.cancel() is False
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_cancel_then_worker_exit_keeps_cancelled_state(self):
+        # cancel racing with worker exit: waiters see exactly one
+        # terminal state (Cancelled, not WorkerLostError).
+        pool, started, release, executed = _lab_pool(self.ctx, synack=True)
+        try:
+            blocker = pool.apply_async(_lab_sleep_task, ('blocker',))
+            assert started.wait(10)
+            victim = pool.apply_async(_lab_quick_task, ('victim',))
+            assert victim.cancel() is True
+            # kill the worker while the cancelled task is still queued.
+            pool.terminate_job(pool._pool[0].pid, signal.SIGKILL)
+            with pytest.raises(Cancelled):
+                victim.get(10)
+            assert victim.state == billiard.pool.ApplyResult.CANCELLED
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_dispatch_gate_drops_cancelled_tasks(self):
+        # unit-level test of the dispatch gate: a task cancelled before
+        # dispatch is dropped instead of being written to the inqueue.
+        pool = billiard.pool.Pool(1)
+        try:
+            sent = []
+            real_put = pool._quick_put
+            pool._quick_put = sent.append
+            try:
+                cancelled = billiard.pool.ApplyResult(pool._cache, None)
+                assert cancelled.state == billiard.pool.ApplyResult.PENDING
+                assert cancelled.cancel() is True
+                pool._put_task((billiard.pool.TASK,
+                                (cancelled._job, None, func, (1,), {})))
+                assert sent == []
+                assert cancelled._job not in pool._cache
+
+                normal = billiard.pool.ApplyResult(pool._cache, None)
+                pool._put_task((billiard.pool.TASK,
+                                (normal._job, None, func, (1,), {})))
+                assert len(sent) == 1
+                assert normal._dispatched
+                # dispatched without synack: cannot be recalled.
+                assert normal.cancel() is False
+            finally:
+                pool._quick_put = real_put
+        finally:
+            pool.terminate()
+            pool.join()
+
+    def test_cancel_map_async_before_start(self):
+        # map cancellation granularity is the chunk: cancelling before
+        # any chunk started guarantees no chunk (and no item) executes.
+        pool, started, release, executed = _lab_pool(self.ctx, synack=True)
+        try:
+            blocker = pool.apply_async(_lab_blocking_task, ('blocker',))
+            assert started.wait(10)
+            result = pool.map_async(_lab_quick_task, range(4), chunksize=1)
+            assert result.cancel() is True
+            assert result.state == billiard.pool.ApplyResult.CANCELLED
+            release.set()
+            with pytest.raises(Cancelled):
+                result.get(10)
+            sentinel = pool.apply_async(_lab_quick_task, ('sentinel',))
+            assert sentinel.get(10) == 'sentinel'
+            assert blocker.get(10) == 'blocker'
+            assert executed.get(10) == 'blocker'
+            assert executed.get(10) == 'sentinel'
+            with pytest.raises(Empty):
+                executed.get_nowait()
+        finally:
+            release.set()
+            pool.terminate()
+            pool.join()
+
+    def test_cancel_map_async_after_chunk_started_fails(self):
+        # once any chunk of a map started, the whole map can no longer
+        # be cancelled and runs to completion.
+        pool, started, release, executed = _lab_pool(self.ctx, synack=True)
+        try:
+            result = pool.map_async(_lab_blocking_task, range(2),
+                                    chunksize=1)
+            assert started.wait(10)  # first chunk is running
+            assert result.cancel() is False
+            release.set()
+            assert result.get(10) == [0, 1]
+        finally:
+            release.set()
+            pool.terminate()
+            pool.join()
 class test_pool:
     def test_memory_error_from_callback_propagates(self):
         def callback(value):

@@ -34,6 +34,7 @@ from .einfo import ExceptionInfo
 from .dummy import DummyProcess
 from .exceptions import (
     CoroStop,
+    Cancelled,
     RestartFreqExceeded,
     SoftTimeLimitExceeded,
     Terminated,
@@ -424,6 +425,9 @@ class Worker:
             self.inq._writer.close()
         if hasattr(self.outq, '_reader'):
             self.outq._reader.close()
+        if self.synq is not None and hasattr(self.synq, '_writer'):
+            # the worker only reads from the synq: the parent writes.
+            self.synq._writer.close()
 
         if self.initializer is not None:
             self.initializer(*self.initargs)
@@ -971,6 +975,12 @@ class ResultHandler(PoolThread):
 class Pool:
     '''
     Class which supports an async version of applying functions to arguments.
+
+    Tasks that have not started executing yet can be revoked with
+    :meth:`ApplyResult.cancel`/:meth:`MapResult.cancel`.  When the pool
+    is created with ``synack=True`` workers wait for a go-ahead before
+    executing a received task, so cancellation then also works for tasks
+    that were already dispatched but not yet started.
     '''
     _wrap_exception = True
     Worker = Worker
@@ -1070,6 +1080,7 @@ class Pool:
         self._pool = []
         self._poolctrl = {}
         self._on_ready_counters = {}
+        self._synq_senders = {}
         self.putlocks = putlocks
         self._putlock = semaphore or LaxBoundedSemaphore(self._processes)
         for i in range(self._processes):
@@ -1080,7 +1091,7 @@ class Pool:
             self._worker_handler.start()
 
         self._task_handler = self.TaskHandler(self._taskqueue,
-                                              self._quick_put,
+                                              self._put_task,
                                               self._outqueue,
                                               self._pool,
                                               self._cache)
@@ -1164,7 +1175,14 @@ class Pool:
         ), (None, None))
 
     def get_process_queues(self):
-        return self._inqueue, self._outqueue, None
+        """Get the queues used by a new worker process.
+
+        A dedicated syn(ack) queue is created per worker when the pool
+        is started with ``synack=True``, so that the pool can tell the
+        worker whether a task it received may run (see ``send_ack``).
+        """
+        synq = self._ctx.SimpleQueue() if self.synack else None
+        return self._inqueue, self._outqueue, synq
 
     def _create_worker_process(self, i):
         sentinel = self._ctx.Event() if self.allow_restart else None
@@ -1186,6 +1204,10 @@ class Pool:
         w.daemon = True
         w.index = i
         w.start()
+        if synq is not None:
+            # the parent only writes to the synq, the worker only reads.
+            synq._reader.close()
+            self._synq_senders[w.pid] = synq
         self._poolctrl[w.pid] = sentinel
         self._on_ready_counters[w.pid] = on_ready_counter
         if self.on_process_up:
@@ -1239,6 +1261,12 @@ class Pool:
                 del self._pool[i]
                 del self._poolctrl[worker.pid]
                 del self._on_ready_counters[worker.pid]
+                synq = self._synq_senders.pop(worker.pid, None)
+                if synq is not None:
+                    try:
+                        synq._writer.close()
+                    except (IOError, OSError):
+                        pass
         if cleaned:
             all_pids = [w.pid for w in self._pool]
             for job in list(self._cache.values()):
@@ -1400,6 +1428,31 @@ class Pool:
             return False, None
         self._poll_result = _poll_result
 
+    def _put_task(self, task):
+        """Write a task message to the inqueue, unless it was cancelled.
+
+        This is the dispatch gate: the cancelled check and the queue
+        write are serialized against ``ApplyResult.cancel`` by the
+        result mutex, so a task that was successfully cancelled while
+        waiting to be dispatched is guaranteed to never reach a worker.
+        """
+        if task is None or task[0] != TASK:
+            self._quick_put(task)
+            return
+        job, i = task[1][0], task[1][1]
+        result = self._cache.get(job)
+        if result is None:
+            self._quick_put(task)
+            return
+        with result._mutex:
+            if result._chunk_cancelled(i):
+                # cancelled before dispatch: drop the task so the
+                # function is guaranteed to never execute.
+                result._chunk_dropped(i)
+                return
+            self._quick_put(task)
+            result._mark_dispatched(i)
+
     def _start_timeout_handler(self):
         # ensure more than one thread does not start the timeout handler
         # thread at once.
@@ -1452,7 +1505,9 @@ class Pool:
         lost_worker_timeout = lost_worker_timeout or self.lost_worker_timeout
         if chunksize == 1:
             result = IMapIterator(self._cache,
-                                  lost_worker_timeout=lost_worker_timeout)
+                                  lost_worker_timeout=lost_worker_timeout,
+                                  send_ack=self.send_ack if self.synack
+                                  else None)
             self._taskqueue.put((
                 ((TASK, (result._job, i, func, (x,), {}))
                  for i, x in enumerate(iterable)),
@@ -1463,7 +1518,9 @@ class Pool:
             assert chunksize > 1
             task_batches = Pool._get_tasks(func, iterable, chunksize)
             result = IMapIterator(self._cache,
-                                  lost_worker_timeout=lost_worker_timeout)
+                                  lost_worker_timeout=lost_worker_timeout,
+                                  send_ack=self.send_ack if self.synack
+                                  else None)
             self._taskqueue.put((
                 ((TASK, (result._job, i, mapstar, (x,), {}))
                  for i, x in enumerate(task_batches)),
@@ -1482,6 +1539,7 @@ class Pool:
         if chunksize == 1:
             result = IMapUnorderedIterator(
                 self._cache, lost_worker_timeout=lost_worker_timeout,
+                send_ack=self.send_ack if self.synack else None,
             )
             self._taskqueue.put((
                 ((TASK, (result._job, i, func, (x,), {}))
@@ -1494,6 +1552,7 @@ class Pool:
             task_batches = Pool._get_tasks(func, iterable, chunksize)
             result = IMapUnorderedIterator(
                 self._cache, lost_worker_timeout=lost_worker_timeout,
+                send_ack=self.send_ack if self.synack else None,
             )
             self._taskqueue.put((
                 ((TASK, (result._job, i, mapstar, (x,), {}))
@@ -1546,6 +1605,10 @@ class Pool:
                 on_timeout_cancel=self.on_timeout_cancel,
                 callbacks_propagate=callbacks_propagate,
                 send_ack=self.send_ack if self.synack else None,
+                on_cancelled=(
+                    self._putlock.release
+                    if waitforslot and self._putlock is not None else None
+                ),
                 correlation_id=correlation_id,
             )
             if timeout or soft_timeout:
@@ -1555,11 +1618,22 @@ class Pool:
                 self._taskqueue.put(([(TASK, (result._job, None,
                                     func, args, kwds))], None))
             else:
-                self._quick_put((TASK, (result._job, None, func, args, kwds)))
+                self._put_task((TASK, (result._job, None, func, args, kwds)))
             return result
 
-    def send_ack(self, response, job, i, fd):
-        pass
+    def send_ack(self, response, pid, job, fd):
+        """Tell a worker whether a task it received may run (synack only).
+
+        Sends ``response`` (``ACK`` = go ahead, ``NACK`` = discard the
+        task) to the synq of the worker ``pid`` that acknowledged ``job``.
+        """
+        synq = self._synq_senders.get(pid)
+        if synq is None:
+            return  # worker is already gone
+        try:
+            synq._writer.send((response, (job,)))
+        except (IOError, OSError):
+            pass  # worker died before receiving the answer
 
     def terminate_job(self, pid, sig=None):
         proc, _ = self._process_by_pid(pid)
@@ -1601,7 +1675,8 @@ class Pool:
 
         task_batches = Pool._get_tasks(func, iterable, chunksize)
         result = MapResult(self._cache, chunksize, len(iterable), callback,
-                           error_callback=error_callback)
+                           error_callback=error_callback,
+                           send_ack=self.send_ack if self.synack else None)
         self._taskqueue.put((((TASK, (result._job, i, mapper, (x,), {}))
                               for i, x in enumerate(task_batches)), None))
         return result
@@ -1746,11 +1821,27 @@ class ApplyResult:
     _write_to = None
     _scheduled_for = None
 
+    #: Task lifecycle states, as returned by :attr:`state`.
+    #: the task is waiting to be dispatched to a worker.
+    PENDING = 'PENDING'
+    #: the task was written to the work queue, no worker received it yet.
+    DISPATCHED = 'DISPATCHED'
+    #: a worker received the task and is waiting for the go-ahead
+    #: (only distinguishable on pools created with ``synack=True``).
+    ACKED = 'ACKED'
+    #: the task function is executing (or can no longer be cancelled).
+    RUNNING = 'RUNNING'
+    #: the task finished (successfully or not).
+    READY = 'READY'
+    #: the task was cancelled before it started executing.
+    CANCELLED = 'CANCELLED'
+
     def __init__(self, cache, callback, accept_callback=None,
                  timeout_callback=None, error_callback=None, soft_timeout=None,
                  timeout=None, lost_worker_timeout=LOST_WORKER_TIMEOUT,
                  on_timeout_set=None, on_timeout_cancel=None,
                  callbacks_propagate=(), send_ack=None,
+                 on_cancelled=None,
                  correlation_id=None):
         self.correlation_id = correlation_id
         self._mutex = Lock()
@@ -1768,9 +1859,12 @@ class ApplyResult:
         self._on_timeout_cancel = on_timeout_cancel
         self._callbacks_propagate = callbacks_propagate or ()
         self._send_ack = send_ack
+        self._on_cancelled = on_cancelled
 
         self._accepted = False
         self._cancelled = False
+        self._dispatched = False
+        self._goahead_sent = False
         self._worker_pid = None
         self._time_accepted = None
         self._terminated = None
@@ -1795,6 +1889,90 @@ class ApplyResult:
     def _cancel(self):
         """Only works if synack is used."""
         self._cancelled = True
+
+    def cancel(self):
+        """Attempt to cancel the task before its function starts executing.
+
+        Returns True if the task was cancelled: the task function is
+        then guaranteed to never execute (the task is either dropped
+        before dispatch or the worker is told to discard it), and all
+        waiters are woken up with a :exc:`billiard.exceptions.Cancelled`
+        error.
+
+        Returns False if the task already started executing or already
+        finished: cancellation never kills a running task or its worker.
+
+        Cancellation is possible while the task is waiting to be
+        dispatched, and -- on pools created with ``synack=True`` -- also
+        after it was dispatched, as long as no worker was told to start
+        executing it.  On pools without synack a task that was already
+        handed to the work queue cannot be recalled, so cancel() then
+        returns False.
+        """
+        with self._mutex:
+            if self._cancelled:
+                return True
+            if self.ready():
+                return False
+            if self._send_ack is not None:
+                # synack pool: cancellable until the worker was told
+                # to start executing the task.
+                if self._goahead_sent:
+                    return False
+            elif self._dispatched:
+                # already handed to a worker and cannot be recalled.
+                return False
+            self._cancelled = True
+            on_cancelled = self._on_cancelled
+        self._set_cancelled()
+        if on_cancelled is not None:
+            on_cancelled()
+        return True
+
+    @property
+    def state(self):
+        """Current lifecycle state of the task.
+
+        One of the class constants ``PENDING``, ``DISPATCHED``, ``ACKED``,
+        ``RUNNING``, ``READY`` or ``CANCELLED``.
+        """
+        with self._mutex:
+            if self._cancelled:
+                return self.CANCELLED
+            if self.ready():
+                return self.READY
+            if self._accepted:
+                if self._send_ack is not None and not self._goahead_sent:
+                    return self.ACKED
+                return self.RUNNING
+            if self._dispatched:
+                return self.DISPATCHED
+            return self.PENDING
+
+    def _set_cancelled(self):
+        try:
+            raise Cancelled(
+                'job {0} was cancelled before it started'.format(self._job),
+            )
+        except Cancelled as exc:
+            einfo = ExceptionInfo()
+            # raise the Cancelled error itself from get(), not the
+            # ExceptionWithTraceback wrapper used for remote errors.
+            einfo.exception = exc
+            self._set(None, (False, einfo))
+
+    # -- hooks used by the pool dispatch gate (called with _mutex held)
+
+    def _chunk_cancelled(self, i):
+        return self._cancelled
+
+    def _chunk_dropped(self, i):
+        # cancelled before dispatch: the task will never be sent anywhere,
+        # so the job can leave the cache right away.
+        self.discard()
+
+    def _mark_dispatched(self, i):
+        self._dispatched = True
 
     def discard(self):
         self._cache.pop(self._job, None)
@@ -1844,6 +2022,11 @@ class ApplyResult:
 
     def _set(self, i, obj):
         with self._mutex:
+            if self._event.is_set():
+                # a terminal state was already published (e.g. cancelled,
+                # or a worker-lost/timeout error): all waiters must see
+                # exactly one terminal state, so ignore further ones.
+                return
             if self._on_timeout_cancel:
                 self._on_timeout_cancel(self)
             self._success, self._value = obj
@@ -1865,31 +2048,45 @@ class ApplyResult:
 
     def _ack(self, i, time_accepted, pid, synqW_fd):
         with self._mutex:
-            if self._cancelled and self._send_ack:
-                self._accepted = True
-                if synqW_fd:
-                    return self._send_ack(NACK, pid, self._job, synqW_fd)
-                return
             self._accepted = True
             self._time_accepted = time_accepted
             self._worker_pid = pid
-            if self.ready():
-                # ack received after set()
-                self._cache.pop(self._job, None)
-            if self._on_timeout_set:
-                self._on_timeout_set(self, self._soft_timeout, self._timeout)
-            response = ACK
-            if self._accept_callback:
-                try:
-                    self._accept_callback(pid, time_accepted)
-                except self._propagate_errors:
-                    response = NACK
-                    raise
-                except Exception:
-                    response = NACK
-                    # ignore other errors
+            cancelled = self._cancelled
+            if cancelled:
+                if self.ready():
+                    self._cache.pop(self._job, None)
+            else:
+                if self.ready():
+                    # ack received after set()
+                    self._cache.pop(self._job, None)
+                if self._on_timeout_set:
+                    self._on_timeout_set(self, self._soft_timeout,
+                                         self._timeout)
+        if cancelled:
+            # the job was cancelled before the worker started executing
+            # it: tell the worker to discard the task (synack only).
             if self._send_ack and synqW_fd:
-                return self._send_ack(response, pid, self._job, synqW_fd)
+                self._send_ack(NACK, pid, self._job, synqW_fd)
+            return
+        response = ACK
+        if self._accept_callback:
+            try:
+                self._accept_callback(pid, time_accepted)
+            except self._callbacks_propagate:
+                response = NACK
+                raise
+            except Exception:
+                response = NACK
+                # ignore other errors
+        with self._mutex:
+            if self._cancelled:
+                # cancelled while the accept callback was running.
+                response = NACK
+            elif self._send_ack is not None:
+                # past this point the task can no longer be cancelled.
+                self._goahead_sent = True
+        if self._send_ack and synqW_fd:
+            self._send_ack(response, pid, self._job, synqW_fd)
 
 #
 # Class whose instances are returned by `Pool.map_async()`
@@ -1898,9 +2095,11 @@ class ApplyResult:
 
 class MapResult(ApplyResult):
 
-    def __init__(self, cache, chunksize, length, callback, error_callback):
+    def __init__(self, cache, chunksize, length, callback, error_callback,
+                 send_ack=None):
         ApplyResult.__init__(
             self, cache, callback, error_callback=error_callback,
+            send_ack=send_ack,
         )
         self._success = True
         self._length = length
@@ -1910,41 +2109,126 @@ class MapResult(ApplyResult):
         self._time_accepted = [None] * length
         self._chunksize = chunksize
         if chunksize <= 0:
+            self._nchunks = 0
             self._number_left = 0
             self._event.set()
             del cache[self._job]
         else:
-            self._number_left = length // chunksize + bool(length % chunksize)
+            self._nchunks = length // chunksize + bool(length % chunksize)
+            self._number_left = self._nchunks
+        self._dispatched = [False] * self._nchunks
+        self._goahead_sent = [False] * self._nchunks
+        self._nchunks_resolved = 0
+
+    def cancel(self):
+        """Attempt to cancel the whole map operation before it starts.
+
+        Cancellation granularity is the chunk: every chunk is either
+        executed completely or not at all, and cancelling never splits a
+        chunk, so a cancelled map never leaves a chunk half executed.
+
+        Returns True if no chunk started executing yet: every chunk is
+        then guaranteed to never execute and all waiters are woken up
+        with a :exc:`billiard.exceptions.Cancelled` error.  Returns
+        False if any chunk already started or the map already finished;
+        in that case nothing is cancelled and no process is killed.
+        """
+        with self._mutex:
+            if self._cancelled:
+                return True
+            if self.ready():
+                return False
+            if self._send_ack is not None:
+                if any(self._goahead_sent):
+                    return False
+            elif any(self._dispatched):
+                return False
+            self._cancelled = True
+        self._set_cancelled()
+        return True
+
+    @property
+    def state(self):
+        with self._mutex:
+            if self._cancelled:
+                return self.CANCELLED
+            if self.ready():
+                return self.READY
+            if any(self._goahead_sent):
+                return self.RUNNING
+            if any(self._accepted):
+                if self._send_ack is not None:
+                    return self.ACKED
+                return self.RUNNING
+            if any(self._dispatched):
+                return self.DISPATCHED
+            return self.PENDING
+
+    # -- hooks used by the pool dispatch gate (called with _mutex held)
+
+    def _chunk_cancelled(self, i):
+        return self._cancelled
+
+    def _chunk_dropped(self, i):
+        self._chunk_resolved()
+
+    def _mark_dispatched(self, i):
+        self._dispatched[i] = True
+
+    def _chunk_resolved(self):
+        # a cancelled chunk reached its final state (dropped before
+        # dispatch or NACKed after it): forget the job once all of its
+        # chunks are accounted for.
+        self._nchunks_resolved += 1
+        if self._nchunks_resolved >= self._nchunks:
+            self._cache.pop(self._job, None)
 
     def _set(self, i, success_result):
-        success, result = success_result
-        if success:
-            self._value[i * self._chunksize:(i + 1) * self._chunksize] = result
-            self._number_left -= 1
-            if self._number_left == 0:
-                if self._callback:
-                    self._callback(self._value)
-                if self._accepted:
+        with self._mutex:
+            if self._event.is_set():
+                # terminal state already published: ignore further ones.
+                return
+            success, result = success_result
+            if success:
+                self._value[
+                    i * self._chunksize:(i + 1) * self._chunksize] = result
+                self._number_left -= 1
+                if self._number_left == 0:
+                    if self._callback:
+                        self._callback(self._value)
+                    if self._accepted:
+                        self._cache.pop(self._job, None)
+                    self._event.set()
+            else:
+                self._success = False
+                self._value = result
+                if self._error_callback:
+                    self._error_callback(self._value)
+                if self._accepted and not self._cancelled:
                     self._cache.pop(self._job, None)
                 self._event.set()
-        else:
-            self._success = False
-            self._value = result
-            if self._error_callback:
-                self._error_callback(self._value)
-            if self._accepted:
-                self._cache.pop(self._job, None)
-            self._event.set()
 
     def _ack(self, i, time_accepted, pid, *args):
-        start = i * self._chunksize
-        stop = min((i + 1) * self._chunksize, self._length)
-        for j in range(start, stop):
-            self._accepted[j] = True
-            self._worker_pid[j] = pid
-            self._time_accepted[j] = time_accepted
-        if self.ready():
-            self._cache.pop(self._job, None)
+        synqW_fd = args[0] if args else None
+        with self._mutex:
+            start = i * self._chunksize
+            stop = min((i + 1) * self._chunksize, self._length)
+            for j in range(start, stop):
+                self._accepted[j] = True
+                self._worker_pid[j] = pid
+                self._time_accepted[j] = time_accepted
+            if self._cancelled:
+                # cancelled before this chunk started: resolve it below
+                # by telling the worker to discard it.
+                response = NACK
+                self._chunk_resolved()
+            else:
+                response = ACK
+                self._goahead_sent[i] = True
+                if self.ready():
+                    self._cache.pop(self._job, None)
+        if self._send_ack is not None and synqW_fd:
+            self._send_ack(response, pid, self._job, synqW_fd)
 
     def accepted(self):
         return all(self._accepted)
@@ -1960,10 +2244,13 @@ class MapResult(ApplyResult):
 class IMapIterator:
     _worker_lost = None
 
-    def __init__(self, cache, lost_worker_timeout=LOST_WORKER_TIMEOUT):
+    def __init__(self, cache, lost_worker_timeout=LOST_WORKER_TIMEOUT,
+                 send_ack=None):
         self._cond = threading.Condition(threading.Lock())
+        self._mutex = threading.Lock()
         self._job = next(job_counter)
         self._cache = cache
+        self._send_ack = send_ack
         self._items = deque()
         self._index = 0
         self._length = None
@@ -2027,6 +2314,20 @@ class IMapIterator:
 
     def _ack(self, i, time_accepted, pid, *args):
         self._worker_pids.append(pid)
+        if self._send_ack is not None and args and args[0]:
+            self._send_ack(ACK, pid, self._job, args[0])
+
+    # -- hooks used by the pool dispatch gate: imap results do not
+    # support cancellation, so tasks are always dispatched.
+
+    def _chunk_cancelled(self, i):
+        return False
+
+    def _chunk_dropped(self, i):
+        pass
+
+    def _mark_dispatched(self, i):
+        pass
 
     def ready(self):
         return self._ready

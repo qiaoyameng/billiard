@@ -1,5 +1,20 @@
 Unreleased
 ----------
+- New public ``ApplyResult.cancel()``/``MapResult.cancel()`` API to revoke
+  tasks that have not started executing yet, together with a
+  ``ApplyResult.state`` property distinguishing ``PENDING`` (waiting for
+  dispatch), ``DISPATCHED``, ``ACKED`` (received by a worker, synack
+  pools only), ``RUNNING``, ``READY`` and ``CANCELLED``.  A successful
+  cancel guarantees the task function never executes: the task is either
+  dropped at the dispatch gate or, on pools created with ``synack=True``,
+  the worker is told to discard it after receiving it (billiard now
+  implements the per-worker synq handshake itself).  Cancelling a task
+  that already started returns False and never kills the worker.  All
+  waiters observe exactly one terminal state (``Cancelled``) even when
+  cancellation races with the ACK, the result or a worker exit.  Map
+  cancellation granularity is the chunk: a chunk either runs completely
+  or not at all, and ``MapResult.cancel()`` succeeds only if no chunk
+  has started yet.
 - `Queue.put()`, `Queue.get()` and `JoinableQueue.put()` raise `ValueError`
   when the queue is closed, as in `multiprocessing`, instead of an
   `AssertionError` (or, under `python -O`, silently dropping the item) and an
