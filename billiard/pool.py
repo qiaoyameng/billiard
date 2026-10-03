@@ -12,6 +12,7 @@
 #
 import copy
 import errno
+import inspect
 import itertools
 import os
 import platform
@@ -41,6 +42,7 @@ from .exceptions import (
     TimeoutError,
     WorkerLostError,
 )
+from .reduction import ForkingPickler
 from time import monotonic
 from queue import Queue, Empty
 from .util import Finalize, debug, warning
@@ -91,6 +93,26 @@ READY = 1
 TASK = 2
 NACK = 3
 DEATH = 4
+# Worker -> parent stream of opt-in progress events for a running job.
+# Unlike ACK/READY this traffic is strictly best-effort: if the consumer
+# is too slow events are coalesced or dropped and the gaps are reported
+# instead of backing up the critical ACK/READY path.
+PROGRESS = 5
+
+# Pending-progress overflow policies.
+PROGRESS_COALESCE = 1      # keep newest, merge dropped events into a gap
+PROGRESS_DROP_NEWEST = 2   # drop the event that does not fit
+
+DEFAULT_PROGRESS_MAX_EVENTS = 100
+DEFAULT_PROGRESS_MAX_BYTES = 1024 * 1024
+# Max time a worker waits for buffered progress to flush before sending
+# the final READY result (best-effort ordering, never blocks the result).
+PROGRESS_FLUSH_TIMEOUT = 2.0
+
+# Thread-local holding the progress reporter bound to the job currently
+# running in this worker (or ``None`` outside of a job / when progress is
+# not opted in).  ``report_progress()`` consults it.
+_progress_local = threading.local()
 
 #
 # Exit code constants
@@ -224,6 +246,383 @@ class WorkersJoined(Exception):
     """All workers have terminated."""
 
 
+class ProgressGap:
+    """Notification that one or more progress events were lost.
+
+    Delivered to a progress callback in place of the missing events.  The
+    gap refers to progress sequence numbers ``[first_seq, last_seq]`` for
+    ``job`` and records *where* the loss happened (``"worker"`` if the
+    producing worker had to shed load, ``"parent"`` if the parent-side
+    pending buffer overflowed while the consumer was paused).
+    """
+
+    __slots__ = ('job', 'first_seq', 'last_seq', 'count', 'where')
+
+    def __init__(self, job, first_seq, last_seq, count, where):
+        self.job = job
+        self.first_seq = first_seq
+        self.last_seq = last_seq
+        self.count = count
+        self.where = where
+
+    def __repr__(self):
+        return ('<ProgressGap job={0!r} seq={1}..{2} count={3} '
+                'where={4!r}>'.format(
+                    self.job, self.first_seq, self.last_seq,
+                    self.count, self.where))
+
+    def __eq__(self, other):
+        if not isinstance(other, ProgressGap):
+            return NotImplemented
+        return (self.job == other.job and
+                self.first_seq == other.first_seq and
+                self.last_seq == other.last_seq and
+                self.count == other.count and
+                self.where == other.where)
+
+
+def report_progress(payload=None):
+    """Report progress for the job currently running in this worker.
+
+    Opt-in helper usable from inside a task::
+
+        def my_task(args, _progress=None):
+            for i in range(100):
+                ...
+                _progress(i)       # injected reporter, or
+                report_progress(i) # module-level helper
+
+    Raises ``RuntimeError`` when the job was not submitted with progress
+    enabled (i.e. there is no reporter bound to the running job).
+    Never raises when progress is enabled: failures to enqueue are handled
+    by coalescing/dropping according to the job's overflow policy.
+    """
+    reporter = getattr(_progress_local, 'reporter', None)
+    if reporter is None:
+        raise RuntimeError(
+            'report_progress() called outside of a job that opted in to '
+            'progress reporting (no progress reporter is bound to the '
+            'running job)')
+    reporter.report(payload)
+
+
+def _progress_parameter(fun):
+    """Return the name of an injectable progress kwarg on *fun*, or None."""
+    try:
+        sig = inspect.signature(fun)
+    except (TypeError, ValueError):
+        return None
+    for name in ('_progress', 'progress', 'progress_reporter'):
+        param = sig.parameters.get(name)
+        if param is not None and param.kind in (
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            return name
+    return None
+
+
+class _WorkerProgressReporter:
+    """Bound per-job reporter used inside worker processes.
+
+    Progress events are appended to a bounded in-memory queue and a
+    daemon feeder thread forwards them onto ``outq`` as
+    ``(PROGRESS, (...))`` messages.  This keeps the workloop -- which
+    owns the critical ACK/READY path -- completely non-blocking: a slow
+    parent can never make ``report()`` wait.  When the bounded queue is
+    full the oldest pending events are coalesced into a single
+    ``ProgressGap(where='worker')`` marker; the parent also detects
+    discontinuities independently from the sequence numbers.
+    """
+
+    def __init__(self, job, outq,
+                 max_events=DEFAULT_PROGRESS_MAX_EVENTS,
+                 max_bytes=DEFAULT_PROGRESS_MAX_BYTES):
+        self.job = job
+        self.outq = outq
+        self.max_events = max_events
+        self.max_bytes = max_bytes
+        self._seq = -1
+        self._lock = threading.Lock()
+        self._pending = deque()   # (seq, is_gap, payload)
+        self._bytes = 0
+        self._cond = threading.Condition(self._lock)
+        self._closed = False
+        self._feeder = threading.Thread(
+            target=self._feed, name='ProgressFeed-%s' % (job,))
+        self._feeder.daemon = True
+        self._feeder.start()
+
+    def _next_seq(self):
+        self._seq += 1
+        return self._seq
+
+    @staticmethod
+    def _size(payload):
+        try:
+            return len(ForkingPickler.dumps(payload))
+        except Exception:
+            return 0
+
+    def _enqueue_gap(self, first_seq, last_seq, count):
+        gap = ProgressGap(self.job, first_seq, last_seq, count, 'worker')
+        # Merge with an adjacent gap marker if one is already queued.
+        if self._pending and self._pending[0][1]:
+            head = self._pending[0]
+            merged = ProgressGap(
+                self.job,
+                min(head[2].first_seq, first_seq),
+                max(head[2].last_seq, last_seq),
+                head[2].count + count, 'worker')
+            self._pending[0] = (merged.first_seq, True, merged, 0)
+        else:
+            self._pending.appendleft((first_seq, True, gap, 0))
+
+    def report(self, payload=None):
+        with self._lock:
+            seq = self._next_seq()
+            if self._closed:
+                return
+            size = self._size(payload)
+            # Reserve room for the incoming event.  Gap markers pushed
+            # during eviction carry no byte weight and always fit.
+            dropped_first = dropped_last = dropped_count = None
+            while (self._pending and
+                   (len(self._pending) >= self.max_events or
+                    self._bytes + size > self.max_bytes)):
+                dseq, d_is_gap, d_payload, d_size = \
+                    self._pending.popleft()
+                self._bytes -= d_size
+                if d_is_gap:
+                    df, dl, dc = (d_payload.first_seq,
+                                  d_payload.last_seq, d_payload.count)
+                else:
+                    df = dl = dseq
+                    dc = 1
+                dropped_first = df if dropped_first is None else min(
+                    dropped_first, df)
+                dropped_last = dl if dropped_last is None else max(
+                    dropped_last, dl)
+                dropped_count = (dropped_count or 0) + dc
+            if dropped_count is not None:
+                self._enqueue_gap(
+                    dropped_first, dropped_last, dropped_count)
+            self._pending.append((seq, False, payload, size))
+            self._bytes += size
+            self._cond.notify()
+
+    def _feed(self):
+        while True:
+            with self._cond:
+                while not self._pending and not self._closed:
+                    self._cond.wait(1.0)
+                if not self._pending and self._closed:
+                    return
+                seq, is_gap, payload, size = self._pending.popleft()
+                if not is_gap:
+                    self._bytes -= size
+            try:
+                self.outq.put((PROGRESS, (self.job, seq, is_gap, payload)))
+            except Exception as exc:
+                if get_errno(exc) in (errno.EPIPE, errno.ESHUTDOWN):
+                    return
+                debug('progress feeder write failed: %r', exc)
+
+    def close(self):
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
+class _ProgressBuffer:
+    """Bounded parent-side buffer of pending progress for one job.
+
+    Limits both the number of pending events and their combined byte
+    size.  On overflow, *policy* decides whether the oldest pending
+    events are coalesced into a gap report (``PROGRESS_COALESCE``) or the
+    incoming event is dropped (``PROGRESS_DROP_NEWEST``).  The dispatcher
+    drains the buffer; while paused by a slow callback the buffer absorbs
+    the backlog without touching the result-handler thread.
+    """
+
+    def __init__(self, job, callback,
+                 max_events=DEFAULT_PROGRESS_MAX_EVENTS,
+                 max_bytes=DEFAULT_PROGRESS_MAX_BYTES,
+                 policy=PROGRESS_COALESCE):
+        self.job = job
+        self.callback = callback
+        self.max_events = max_events
+        self.max_bytes = max_bytes
+        self.policy = policy
+        self._cond = threading.Condition()
+        self._events = deque()
+        self._bytes = 0
+        self._closed = False
+        self._next_seq = 0
+        self._last_seen_seq = None
+        # Pause gate: while cleared, events stay buffered (subject to the
+        # overflow policy) and the callback is not invoked.
+        self._gate = threading.Event()
+        self._gate.set()
+        # Snapshot of gaps already surfaced to the consumer.
+        self._gaps_seen = []
+
+    @staticmethod
+    def _payload_size(payload):
+        try:
+            return len(ForkingPickler.dumps(payload))
+        except Exception:
+            return 0
+
+    def _make_gap(self, first_seq, last_seq, count):
+        return ProgressGap(self.job, first_seq, last_seq, count, 'parent')
+
+    def add(self, seq, is_gap, payload):
+        with self._cond:
+            if self._closed:
+                return
+            size = 0 if is_gap else self._payload_size(payload)
+            over = (len(self._events) >= self.max_events or
+                    self._bytes + size > self.max_bytes)
+            if over:
+                if self.policy == PROGRESS_DROP_NEWEST:
+                    # Drop the incoming event.  No gap marker is queued
+                    # here: drain() synthesises holes from sequence
+                    # numbers, and a trailing drop is reported on close.
+                    self._last_seen_seq = seq
+                    self._cond.notify()
+                    return
+                else:
+                    self._evict_for(size)
+            event = (seq, is_gap, payload, size)
+            self._events.append(event)
+            self._bytes += size
+            self._last_seen_seq = seq
+            self._cond.notify()
+
+    def _evict_for(self, incoming_size):
+        first = last = None
+        count = 0
+        while (len(self._events) >= self.max_events or
+               self._bytes + incoming_size > self.max_bytes):
+            seq, is_gap, payload, size = self._events.popleft()
+            self._bytes -= size
+            if is_gap and isinstance(payload, ProgressGap):
+                ev_first, ev_last = payload.first_seq, payload.last_seq
+                ev_count = payload.count
+            else:
+                ev_first = ev_last = seq
+                ev_count = 1
+            first = ev_first if first is None else min(first, ev_first)
+            last = ev_last if last is None else max(last, ev_last)
+            count += ev_count
+        if count:
+            # Coalesce with an existing head gap marker (created on a
+            # previous overflow) so the consumer never sees adjacent,
+            # overlapping gap reports.
+            head = self._events[0] if self._events else None
+            if head is not None and head[1] and isinstance(
+                    head[2], ProgressGap):
+                hg = head[2]
+                merged = self._make_gap(
+                    min(hg.first_seq, first), max(hg.last_seq, last),
+                    hg.count + count)
+                self._events[0] = (merged.first_seq, True, merged, 0)
+            else:
+                self._events.appendleft(
+                    (first, True, self._make_gap(first, last, count), 0))
+
+    def drain(self, callback):
+        """Pop and invoke callback for every currently buffered event.
+
+        Fills sequence holes with gap reports before invoking the
+        callback.  Callback exceptions do not interrupt draining.
+        """
+        while True:
+            # Honour pause(): block at the gate without dequeuing, so
+            # events accumulate (and overflow is handled) upstream.
+            if not self._gate.wait(timeout=0.5):
+                if self._closed:
+                    return
+                continue
+            with self._cond:
+                while not self._events and not self._closed:
+                    self._cond.wait(1.0)
+                if not self._events:
+                    if self._closed:
+                        self._emit_trailing_gap(callback)
+                        return
+                    continue
+                seq, is_gap, payload, size = self._events.popleft()
+                self._bytes -= size
+            if is_gap and isinstance(payload, ProgressGap):
+                # A gap marker is itself authoritative about the lost
+                # range; deliver it as-is and advance past its end.  Any
+                # overlap with already-consumed sequences is ignored.
+                if payload.last_seq >= self._next_seq:
+                    self._deliver(callback, payload)
+                    self._next_seq = payload.last_seq + 1
+                continue
+            expected = self._next_seq
+            if seq > expected:
+                self._deliver(
+                    callback,
+                    self._make_gap(expected, seq - 1, seq - expected))
+                self._next_seq = seq
+            elif seq < expected:
+                # Duplicate/out-of-order tail after a gap: skip it.
+                continue
+            self._next_seq = seq + 1
+            self._deliver(callback, payload)
+
+    def _emit_trailing_gap(self, callback):
+        if self._last_seen_seq is None:
+            return
+        if self._last_seen_seq >= self._next_seq:
+            self._deliver(
+                callback,
+                self._make_gap(
+                    self._next_seq, self._last_seen_seq,
+                    self._last_seen_seq - self._next_seq + 1))
+            self._next_seq = self._last_seen_seq + 1
+
+    def _deliver(self, callback, payload):
+        if isinstance(payload, ProgressGap):
+            self._gaps_seen.append(payload)
+        self._invoke(callback, payload)
+
+    def pause(self):
+        self._gate.clear()
+
+    def resume(self):
+        self._gate.set()
+
+    def gaps(self):
+        """Return a list of ``ProgressGap`` reports already emitted.
+
+        Gaps created while paused or after completion are included once
+        they have been delivered to (or synthesised for) the consumer.
+        """
+        return list(self._gaps_seen)
+
+    @staticmethod
+    def _invoke(callback, payload):
+        try:
+            callback(payload)
+        except MemoryError:
+            raise
+        except Exception as exc:
+            error('Pool progress callback raised exception: %r', exc,
+                  exc_info=1)
+
+    def close(self):
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+        # Let a paused dispatcher flush whatever is still buffered;
+        # late events are rejected via the _closed flag in add().
+        self._gate.set()
+
+
 def soft_timeout_sighandler(signum, frame):
     raise SoftTimeLimitExceeded()
 
@@ -237,12 +636,16 @@ class Worker:
     def __init__(self, inq, outq, synq=None, initializer=None, initargs=(),
                  maxtasks=None, sentinel=None, on_exit=None,
                  sigprotection=True, wrap_exception=True,
-                 max_memory_per_child=None, on_ready_counter=None):
+                 max_memory_per_child=None, on_ready_counter=None,
+                 progress_max_events=DEFAULT_PROGRESS_MAX_EVENTS,
+                 progress_max_bytes=DEFAULT_PROGRESS_MAX_BYTES):
         assert maxtasks is None or (type(maxtasks) == int and maxtasks > 0)
         self.initializer = initializer
         self.initargs = initargs
         self.maxtasks = maxtasks
         self.max_memory_per_child = max_memory_per_child
+        self.progress_max_events = progress_max_events
+        self.progress_max_bytes = progress_max_bytes
         self._shutdown = sentinel
         self.on_exit = on_exit
         self.sigprotection = sigprotection
@@ -271,7 +674,8 @@ class Worker:
             self.inq, self.outq, self.synq, self.initializer,
             self.initargs, self.maxtasks, self._shutdown, self.on_exit,
             self.sigprotection, self.wrap_exception, self.max_memory_per_child,
-            self.on_ready_counter
+            self.on_ready_counter, self.progress_max_events,
+            self.progress_max_bytes,
         )
 
     def __call__(self):
@@ -318,6 +722,48 @@ class Worker:
     def prepare_result(self, result):
         return result
 
+    def _unpack_task(self, args_):
+        # The task tuple is ``(job, i, fun, args, kwargs)`` historically;
+        # progress-aware pools append a progress-options element.  Missing
+        # or None means the job did not opt in to progress reporting.
+        if len(args_) >= 6:
+            job, i, fun, args, kwargs, progress_opts = args_[:6]
+        else:
+            job, i, fun, args, kwargs = args_
+            progress_opts = None
+        return job, i, fun, args, kwargs, progress_opts
+
+    def _bind_progress(self, job, progress_opts):
+        if not progress_opts:
+            return None
+        max_events = progress_opts.get(
+            'max_events', self.progress_max_events)
+        max_bytes = progress_opts.get(
+            'max_bytes', self.progress_max_bytes)
+        reporter = _WorkerProgressReporter(
+            job, self.outq,
+            max_events=max_events, max_bytes=max_bytes)
+        _progress_local.reporter = reporter
+        return reporter
+
+    def _unbind_progress(self, reporter):
+        if reporter is not None:
+            # Stop accepting reports and wait briefly for the feeder to
+            # drain, so progress precedes READY.  Bounded: a wedged pipe
+            # must never delay the final result.
+            reporter.close()
+            reporter._feeder.join(PROGRESS_FLUSH_TIMEOUT)
+            _progress_local.reporter = None
+
+    def _call_task(self, fun, args, kwargs, reporter):
+        if reporter is None:
+            return fun(*args, **kwargs)
+        kwargs = dict(kwargs)
+        injected = _progress_parameter(fun)
+        if injected is not None and injected not in kwargs:
+            kwargs[injected] = reporter.report
+        return fun(*args, **kwargs)
+
     def workloop(self, debug=debug, now=monotonic, pid=None):
         pid = pid or os.getpid()
         put = self.outq.put
@@ -352,15 +798,18 @@ class Worker:
                 if req:
                     type_, args_ = req
                     assert type_ == TASK
-                    job, i, fun, args, kwargs = args_
+                    job, i, fun, args, kwargs, progress_opts = (
+                        self._unpack_task(args_))
                     put((ACK, (job, i, now(), pid, synqW_fd)))
                     if _wait_for_syn:
                         confirm = wait_for_syn(job)
                         if not confirm:
                             continue  # received NACK
                     exit_exc = None
+                    reporter = self._bind_progress(job, progress_opts)
                     try:
-                        result = (True, prepare_result(fun(*args, **kwargs)))
+                        result = (True, prepare_result(
+                            self._call_task(fun, args, kwargs, reporter)))
                     except BaseException as exc:
                         result = (False, ExceptionInfo())
                         if isinstance(exc, (SystemExit, KeyboardInterrupt)):
@@ -368,6 +817,8 @@ class Worker:
                             # hard time limit): report the result, then leave
                             # instead of re-entering the shared inqueue.
                             exit_exc = exc
+                    finally:
+                        self._unbind_progress(reporter)
                     try:
                         put((READY, (job, i, result, inqW_fd)))
                     except Exception as exc:
@@ -783,6 +1234,68 @@ class TimeoutHandler(PoolThread):
             self._it = None
 
 
+class ProgressDispatcher(PoolThread):
+    """Parent-side thread that invokes job progress callbacks.
+
+    The result-handler thread only enqueues progress events into the
+    job's bounded ``_ProgressBuffer``; this thread drains them.  A slow
+    (or paused) progress callback therefore exerts backpressure only on
+    that job's buffer -- which coalesces/drops per its policy -- and
+    never blocks delivery of ACK/READY messages or progress for other
+    jobs.
+    """
+
+    def __init__(self, pool):
+        self.pool = pool
+        self._threads = {}
+        self._lock = threading.Lock()
+        super().__init__()
+
+    def subscribe(self, result):
+        """Start a dedicated daemon thread draining *result*'s buffer.
+
+        One thread per job keeps a slow/paused progress callback for one
+        job from delaying progress delivery for any other job.
+        """
+        buffer = getattr(result, '_progress_buffer', None)
+        if buffer is None:
+            return
+        job = result._job
+
+        def _run():
+            try:
+                buffer.drain(buffer.callback)
+            except Exception as exc:
+                error('progress dispatcher error for job %r: %r',
+                      job, exc, exc_info=1)
+            finally:
+                with self._lock:
+                    self._threads.pop(job, None)
+
+        thread = threading.Thread(
+            target=_run, name='ProgressDispatcher-%s' % (job,))
+        thread.daemon = True
+        with self._lock:
+            self._threads[job] = thread
+        thread.start()
+
+    def unsubscribe(self, job):
+        thread = None
+        with self._lock:
+            thread = self._threads.pop(job, None)
+        return thread
+
+    def body(self):
+        # The actual work happens on per-job daemon threads; this thread
+        # only stays alive as a lifecycle anchor until pool shutdown.
+        while self._state == RUN:
+            time.sleep(0.2)
+        with self._lock:
+            threads = list(self._threads.values())
+        for thread in threads:
+            thread.join(timeout=0.5)
+
+
 class ResultHandler(PoolThread):
 
     def __init__(self, outqueue, get, cache, poll,
@@ -829,6 +1342,15 @@ class ResultHandler(PoolThread):
             except KeyError:
                 return
 
+            # Final result wins.  Close the buffer: the per-job
+            # dispatcher thread drains what is still pending (respecting
+            # the pause gate / callback speed) and synthesises a trailing
+            # gap description, while late progress still in flight is
+            # dropped and never overrides the real outcome.
+            progress_buffer = getattr(item, '_progress_buffer', None)
+            if progress_buffer is not None:
+                progress_buffer.close()
+
             if self.on_ready_counters:
                 worker_pid = next(iter(item.worker_pids()), None)
                 if worker_pid and worker_pid in self.on_ready_counters:
@@ -844,6 +1366,19 @@ class ResultHandler(PoolThread):
             except KeyError:
                 pass
 
+        def on_progress(job, seq, is_gap, payload):
+            # Best-effort only.  Look up the live job: progress for a
+            # completed, cancelled or lost job (cache entry removed) is
+            # silently discarded.
+            try:
+                item = cache[job]
+            except KeyError:
+                return
+            progress_buffer = getattr(item, '_progress_buffer', None)
+            if progress_buffer is None:
+                return
+            progress_buffer.add(seq, is_gap, payload)
+
         def on_death(pid, exitcode):
             try:
                 os.kill(pid, TERM_SIGNAL)
@@ -852,7 +1387,8 @@ class ResultHandler(PoolThread):
                     raise
 
         state_handlers = self.state_handlers = {
-            ACK: on_ack, READY: on_ready, DEATH: on_death
+            ACK: on_ack, READY: on_ready, DEATH: on_death,
+            PROGRESS: on_progress,
         }
 
         def on_state_change(task):
@@ -978,6 +1514,7 @@ class Pool:
     TaskHandler = TaskHandler
     TimeoutHandler = TimeoutHandler
     ResultHandler = ResultHandler
+    ProgressDispatcher = ProgressDispatcher
     SoftTimeLimitExceeded = SoftTimeLimitExceeded
 
     def __init__(self, processes=None, initializer=None, initargs=(),
@@ -997,6 +1534,8 @@ class Pool:
                  context=None,
                  max_memory_per_child=None,
                  enable_timeouts=False,
+                 progress_max_events=DEFAULT_PROGRESS_MAX_EVENTS,
+                 progress_max_bytes=DEFAULT_PROGRESS_MAX_BYTES,
                  **kwargs):
         # bool subclasses int; processes=True would silently spawn 1 worker,
         # and timeout/soft_timeout/lost_worker_timeout=True would become 1s.
@@ -1030,6 +1569,8 @@ class Pool:
         self.soft_timeout = soft_timeout
         self._maxtasksperchild = maxtasksperchild
         self._max_memory_per_child = max_memory_per_child
+        self.progress_max_events = progress_max_events
+        self.progress_max_bytes = progress_max_bytes
         self._initializer = initializer
         self._initargs = initargs
         self._on_process_exit = on_process_exit
@@ -1111,6 +1652,11 @@ class Pool:
         self._result_handler = self.create_result_handler()
         self.handle_result_event = self._result_handler.handle_event
 
+        # Thread owning per-job progress callback threads.  Started
+        # lazily (the first opt-in job) but always created so shutdown
+        # can reference it.
+        self._progress_dispatcher = self.ProgressDispatcher(self)
+
         if threads:
             self._result_handler.start()
 
@@ -1179,6 +1725,8 @@ class Pool:
             wrap_exception=self._wrap_exception,
             max_memory_per_child=self._max_memory_per_child,
             on_ready_counter=on_ready_counter,
+            progress_max_events=self.progress_max_events,
+            progress_max_bytes=self.progress_max_bytes,
         ))
         self._pool.append(w)
         self._process_register_queues(w, (inq, outq, synq))
@@ -1291,6 +1839,10 @@ class Pool:
         job._worker_lost = (monotonic(), exitcode)
 
     def mark_as_worker_lost(self, job, exitcode):
+        # Worker vanished: any buffered/late progress becomes irrelevant;
+        # close it so the dispatcher thread exits without surfacing
+        # partial progress as if the job had completed normally.
+        job._close_progress()
         try:
             raise WorkerLostError(
                 'Worker exited prematurely: {0} Job: {1}.'.format(
@@ -1507,7 +2059,9 @@ class Pool:
                     timeout_callback=None, waitforslot=None,
                     soft_timeout=None, timeout=None, lost_worker_timeout=None,
                     callbacks_propagate=(),
-                    correlation_id=None):
+                    correlation_id=None,
+                    progress_callback=None, progress_max_events=None,
+                    progress_max_bytes=None, progress_policy=None):
         '''
         Asynchronous equivalent of `apply()` method.
 
@@ -1539,6 +2093,31 @@ class Pool:
             waitforslot = self.putlocks if waitforslot is None else waitforslot
             if waitforslot and self._putlock is not None:
                 self._putlock.acquire()
+            progress_enabled = progress_callback is not None
+            if progress_enabled:
+                if not callable(progress_callback):
+                    raise TypeError('progress_callback must be callable')
+                max_events = (self.progress_max_events
+                              if progress_max_events is None
+                              else progress_max_events)
+                max_bytes = (self.progress_max_bytes
+                             if progress_max_bytes is None
+                             else progress_max_bytes)
+                policy = (PROGRESS_COALESCE if progress_policy is None
+                          else progress_policy)
+                if policy not in (PROGRESS_COALESCE,
+                                  PROGRESS_DROP_NEWEST):
+                    raise ValueError(
+                        'progress_policy must be PROGRESS_COALESCE or '
+                        'PROGRESS_DROP_NEWEST')
+                if not isinstance(max_events, int) or max_events < 1:
+                    raise ValueError(
+                        'progress_max_events must be a positive int')
+                if not isinstance(max_bytes, int) or max_bytes < 1:
+                    raise ValueError(
+                        'progress_max_bytes must be a positive int')
+            else:
+                max_events = max_bytes = policy = None
             result = ApplyResult(
                 self._cache, callback, accept_callback, timeout_callback,
                 error_callback, soft_timeout, timeout, lost_worker_timeout,
@@ -1547,16 +2126,33 @@ class Pool:
                 callbacks_propagate=callbacks_propagate,
                 send_ack=self.send_ack if self.synack else None,
                 correlation_id=correlation_id,
+                progress_callback=progress_callback,
+                progress_max_events=max_events,
+                progress_max_bytes=max_bytes,
+                progress_policy=policy,
             )
             if timeout or soft_timeout:
                 # start the timeout handler thread when required.
                 self._start_timeout_handler()
+            if progress_enabled:
+                self._start_progress_dispatcher(result)
+            progress_opts = (
+                {'max_events': max_events, 'max_bytes': max_bytes}
+                if progress_enabled else None)
             if self.threads:
                 self._taskqueue.put(([(TASK, (result._job, None,
-                                    func, args, kwds))], None))
+                                    func, args, kwds,
+                                    progress_opts))], None))
             else:
-                self._quick_put((TASK, (result._job, None, func, args, kwds)))
+                self._quick_put((TASK, (result._job, None, func, args,
+                                        kwds, progress_opts)))
             return result
+
+    def _start_progress_dispatcher(self, result):
+        dispatcher = self._progress_dispatcher
+        if self.threads and not dispatcher._was_started:
+            dispatcher.start()
+        dispatcher.subscribe(result)
 
     def send_ack(self, response, job, i, fd):
         pass
@@ -1634,6 +2230,7 @@ class Pool:
         debug('terminating pool')
         self._state = TERMINATE
         self._worker_handler.terminate()
+        self._progress_dispatcher.terminate()
         self._terminate()
 
     @staticmethod
@@ -1751,7 +2348,9 @@ class ApplyResult:
                  timeout=None, lost_worker_timeout=LOST_WORKER_TIMEOUT,
                  on_timeout_set=None, on_timeout_cancel=None,
                  callbacks_propagate=(), send_ack=None,
-                 correlation_id=None):
+                 correlation_id=None,
+                 progress_callback=None, progress_max_events=None,
+                 progress_max_bytes=None, progress_policy=None):
         self.correlation_id = correlation_id
         self._mutex = Lock()
         self._event = threading.Event()
@@ -1774,6 +2373,18 @@ class ApplyResult:
         self._worker_pid = None
         self._time_accepted = None
         self._terminated = None
+        if progress_callback is not None:
+            self._progress_callback = progress_callback
+            self._progress_buffer = _ProgressBuffer(
+                self._job, progress_callback,
+                max_events=(progress_max_events
+                            if progress_max_events is not None
+                            else DEFAULT_PROGRESS_MAX_EVENTS),
+                max_bytes=progress_max_bytes or DEFAULT_PROGRESS_MAX_BYTES,
+                policy=progress_policy or PROGRESS_COALESCE)
+        else:
+            self._progress_callback = None
+            self._progress_buffer = None
         cache[self._job] = self
 
     def __repr__(self):
@@ -1795,21 +2406,41 @@ class ApplyResult:
     def _cancel(self):
         """Only works if synack is used."""
         self._cancelled = True
+        self._close_progress()
 
     def discard(self):
+        self._close_progress()
         self._cache.pop(self._job, None)
 
     def terminate(self, signum):
         self._terminated = signum
 
     def _set_terminated(self, signum=None):
+        self._close_progress()
         try:
             raise Terminated(-(signum or 0))
         except Terminated:
             self._set(None, (False, ExceptionInfo()))
 
+    def _close_progress(self):
+        # Late progress arriving after completion, cancellation or worker
+        # loss is dropped: the buffer is closed and removed from cache
+        # routing.  Buffered events are not delivered for terminal errors.
+        if self._progress_buffer is not None:
+            self._progress_buffer.close()
+
     def worker_pids(self):
         return [self._worker_pid] if self._worker_pid else []
+
+    @property
+    def progress(self):
+        """Access the progress handle for this job, or None.
+
+        The handle supports ``pause()``, ``resume()`` and ``gaps()``.
+        """
+        if self._progress_buffer is None:
+            return None
+        return _ProgressHandle(self._progress_buffer)
 
     def wait(self, timeout=None):
         self._event.wait(timeout)
@@ -1890,6 +2521,26 @@ class ApplyResult:
                     # ignore other errors
             if self._send_ack and synqW_fd:
                 return self._send_ack(response, pid, self._job, synqW_fd)
+
+
+class _ProgressHandle:
+    """User-facing handle for pausing/resuming progress consumption."""
+
+    def __init__(self, buffer):
+        self._buffer = buffer
+
+    def pause(self):
+        """Stop invoking the progress callback; events stay buffered."""
+        self._buffer.pause()
+
+    def resume(self):
+        """Resume invoking the progress callback."""
+        self._buffer.resume()
+
+    def gaps(self):
+        """Return ``ProgressGap`` reports emitted so far, in order."""
+        return self._buffer.gaps()
+
 
 #
 # Class whose instances are returned by `Pool.map_async()`
