@@ -34,11 +34,13 @@ from .einfo import ExceptionInfo
 from .dummy import DummyProcess
 from .exceptions import (
     CoroStop,
+    PoolNotReady,
     RestartFreqExceeded,
     SoftTimeLimitExceeded,
     Terminated,
     TimeLimitExceeded,
     TimeoutError,
+    WorkerInitError,
     WorkerLostError,
 )
 from time import monotonic
@@ -91,6 +93,8 @@ READY = 1
 TASK = 2
 NACK = 3
 DEATH = 4
+INIT_READY = 5
+INIT_FAILED = 6
 
 #
 # Exit code constants
@@ -425,8 +429,17 @@ class Worker:
         if hasattr(self.outq, '_reader'):
             self.outq._reader.close()
 
-        if self.initializer is not None:
-            self.initializer(*self.initargs)
+        try:
+            if self.initializer is not None:
+                self.initializer(*self.initargs)
+        except BaseException:
+            # Report a picklable diagnostic to the parent before exiting,
+            # so the pool can fail its startup barrier instead of
+            # silently restarting forever.
+            self._send_init_message(INIT_FAILED, ExceptionInfo())
+            raise
+        else:
+            self._send_init_message(INIT_READY, None)
 
         # Make sure all exiting signals call finally: blocks.
         # This is important for the semaphore to be released.
@@ -439,6 +452,12 @@ class Worker:
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except AttributeError:
+            pass
+
+    def _send_init_message(self, kind, payload):
+        try:
+            self.outq.put((kind, (os.getpid(), payload)))
+        except Exception:
             pass
 
     def _make_recv_method(self, conn):
@@ -787,7 +806,8 @@ class ResultHandler(PoolThread):
 
     def __init__(self, outqueue, get, cache, poll,
                  join_exited_workers, putlock, restart_state,
-                 check_timeouts, on_job_ready, on_ready_counters=None):
+                 check_timeouts, on_job_ready, on_ready_counters=None,
+                 on_worker_ready=None, on_worker_init_failed=None):
         self.outqueue = outqueue
         self.get = get
         self.cache = cache
@@ -800,6 +820,8 @@ class ResultHandler(PoolThread):
         self.check_timeouts = check_timeouts
         self.on_job_ready = on_job_ready
         self.on_ready_counters = on_ready_counters
+        self.on_worker_ready = on_worker_ready
+        self.on_worker_init_failed = on_worker_init_failed
         self._make_methods()
         super().__init__()
 
@@ -851,8 +873,17 @@ class ResultHandler(PoolThread):
                 if get_errno(exc) != errno.ESRCH:
                     raise
 
+        def on_init_ready(pid, _payload=None):
+            if self.on_worker_ready is not None:
+                self.on_worker_ready(pid)
+
+        def on_init_failed(pid, einfo):
+            if self.on_worker_init_failed is not None:
+                self.on_worker_init_failed(pid, einfo)
+
         state_handlers = self.state_handlers = {
-            ACK: on_ack, READY: on_ready, DEATH: on_death
+            ACK: on_ack, READY: on_ready, DEATH: on_death,
+            INIT_READY: on_init_ready, INIT_FAILED: on_init_failed,
         }
 
         def on_state_change(task):
@@ -997,6 +1028,9 @@ class Pool:
                  context=None,
                  max_memory_per_child=None,
                  enable_timeouts=False,
+                 max_init_restarts=None,
+                 init_timeout=None,
+                 require_ready=False,
                  **kwargs):
         # bool subclasses int; processes=True would silently spawn 1 worker,
         # and timeout/soft_timeout/lost_worker_timeout=True would become 1s.
@@ -1009,11 +1043,17 @@ class Pool:
             ("max_memory_per_child", max_memory_per_child),
             ("max_restarts", max_restarts),
             ("max_restart_freq", max_restart_freq),
+            ("max_init_restarts", max_init_restarts),
+            ("init_timeout", init_timeout),
         ):
             if isinstance(value, bool):
                 raise TypeError(
                     f"{name} must be an int or float, not bool (got {value!r})"
                 )
+        if max_init_restarts is not None and max_init_restarts < 0:
+            raise ValueError("max_init_restarts must be >= 0 or None")
+        if init_timeout is not None and init_timeout <= 0:
+            raise ValueError("init_timeout must be > 0 or None")
         if processes is not None and processes < 1:
             raise ValueError("Number of processes must be at least 1")
         if maxtasksperchild is not None and (
@@ -1041,6 +1081,26 @@ class Pool:
         self.threads = threads
         self.readers = {}
         self.allow_restart = allow_restart
+        self._require_ready = require_ready
+
+        # Startup barrier state: the pool only becomes ready once every
+        # worker has reported that its initializer completed.
+        self._init_lock = Lock()
+        self._init_done = threading.Event()
+        self._init_ready_pids = set()
+        self._init_failed_pids = set()
+        self._init_failures = []
+        self._init_restarts = 0
+        self._init_aborted = False
+        self._init_error = None
+        self._init_ready_flag = False
+        self.max_init_restarts = (
+            3 if max_init_restarts is None else max_init_restarts
+        )
+        self.init_timeout = init_timeout
+        self._init_deadline = (
+            monotonic() + init_timeout if init_timeout is not None else None
+        )
 
         self.enable_timeouts = bool(
             enable_timeouts or
@@ -1136,11 +1196,132 @@ class Pool:
             self._poll_result, self._join_exited_workers,
             self._putlock, self.restart_state, self.check_timeouts,
             self.on_job_ready, on_ready_counters=self._on_ready_counters,
+            on_worker_ready=self._on_worker_ready,
+            on_worker_init_failed=self._on_worker_init_failed,
             **extra_kwargs
         )
 
     def on_job_ready(self, job, i, obj, inqW_fd):
         pass
+
+    @property
+    def ready(self):
+        """True if all workers have completed their initializer."""
+        return self._init_ready_flag
+
+    def wait_until_ready(self, timeout=None):
+        """Block until every pool worker has finished its initializer.
+
+        Returns True once the pool is ready.  Raises
+        :exc:`~billiard.exceptions.WorkerInitError` if a worker
+        initializer kept failing and the restart budget was exhausted,
+        :exc:`~billiard.exceptions.TimeoutError` if ``timeout`` (or the
+        pool-level ``init_timeout``) expires first, and
+        :exc:`~billiard.exceptions.PoolNotReady` if the pool is closed
+        or terminated before becoming ready.
+        """
+        deadline = None if timeout is None else monotonic() + timeout
+        while True:
+            with self._init_lock:
+                if self._init_ready_flag:
+                    return True
+                error = self._init_error
+                if error is None and self._init_deadline is not None and \
+                        monotonic() >= self._init_deadline:
+                    self._init_aborted = True
+                    error = self._init_error = TimeoutError(
+                        'pool workers did not initialize within '
+                        '%r seconds' % (self.init_timeout,),
+                    )
+                    self._init_done.set()
+            if error is not None:
+                raise error
+            now = monotonic()
+            waits = []
+            if deadline is not None:
+                remaining = deadline - now
+                if remaining <= 0:
+                    raise TimeoutError(
+                        'timed out waiting for pool to become ready')
+                waits.append(remaining)
+            if self._init_deadline is not None:
+                waits.append(max(self._init_deadline - now, 0.0))
+            wait = min(waits) if waits else None
+            if wait is not None and wait <= 0:
+                continue
+            self._init_done.wait(wait)
+
+    def _assert_ready(self):
+        if self._init_ready_flag:
+            return
+        error = self._init_error
+        if error is not None:
+            raise PoolNotReady(
+                'pool is not accepting tasks: initialization failed',
+            ) from error
+        raise PoolNotReady(
+            'pool is not accepting tasks until all workers are initialized',
+        )
+
+    def _update_ready_locked(self):
+        # caller must hold self._init_lock
+        if self._init_done.is_set():
+            return
+        pool = list(self._pool)
+        if pool and len(pool) == self._processes and all(
+                w.pid in self._init_ready_pids for w in pool):
+            self._init_ready_flag = True
+            self._init_done.set()
+
+    def _on_worker_ready(self, pid):
+        with self._init_lock:
+            self._init_ready_pids.add(pid)
+            self._update_ready_locked()
+
+    def _on_worker_init_failed(self, pid, einfo):
+        self._record_init_failure(pid, einfo)
+
+    def _record_init_failure(self, pid, diagnostic):
+        with self._init_lock:
+            if self._init_done.is_set() or self._state != RUN:
+                return
+            if pid in self._init_failed_pids:
+                return
+            self._init_failed_pids.add(pid)
+            self._init_failures.append((pid, diagnostic))
+            self._init_restarts += 1
+            if self._init_restarts > self.max_init_restarts:
+                # Restart budget exhausted: stop repopulating the pool so
+                # it does not keep restarting itself in the background,
+                # and wake any waiters with the collected diagnostics.
+                self._init_aborted = True
+                self._init_error = WorkerInitError(
+                    'worker initialization failed %d time(s); '
+                    'restart budget of %d exhausted' % (
+                        len(self._init_failures), self.max_init_restarts,
+                    ),
+                    diagnostics=list(self._init_failures),
+                )
+                self._init_done.set()
+
+    def _check_init_deadline(self):
+        if self._init_deadline is None or self._init_done.is_set():
+            return
+        if monotonic() >= self._init_deadline:
+            with self._init_lock:
+                if not self._init_done.is_set():
+                    self._init_aborted = True
+                    self._init_error = TimeoutError(
+                        'pool workers did not initialize within '
+                        '%r seconds' % (self.init_timeout,),
+                    )
+                    self._init_done.set()
+
+    def _abort_init_waiters(self, error):
+        with self._init_lock:
+            if not self._init_done.is_set():
+                self._init_error = error
+                self._init_done.set()
 
     def _help_stuff_finish_args(self):
         return self._inqueue, self._task_handler, self._pool
@@ -1239,6 +1420,19 @@ class Pool:
                 del self._pool[i]
                 del self._poolctrl[worker.pid]
                 del self._on_ready_counters[worker.pid]
+        for pid, worker in cleaned.items():
+            exitcode = exitcodes[pid]
+            if exitcode not in (EX_OK, EX_RECYCLE, None) and \
+                    pid not in self._init_ready_pids and \
+                    not getattr(worker, '_controlled_termination', False):
+                # worker exited before reporting ready: count it as an
+                # initialization failure so waiters are woken and the
+                # restart budget is consumed.
+                self._record_init_failure(
+                    pid,
+                    'worker exited before reporting ready: %s' % (
+                        human_status(exitcode),),
+                )
         if cleaned:
             all_pids = [w.pid for w in self._pool]
             for job in list(self._cache.values()):
@@ -1348,7 +1542,7 @@ class Pool:
         for use after reaping workers which have exited.
         """
         for i in range(self._processes - len(self._pool)):
-            if self._state != RUN:
+            if self._state != RUN or self._init_aborted:
                 return
             try:
                 if exitcodes and exitcodes[i] not in (EX_OK, EX_RECYCLE):
@@ -1369,6 +1563,7 @@ class Pool:
     def _maintain_pool(self):
         """"Clean up any exited workers and start replacements for them.
         """
+        self._check_init_deadline()
         joined = self._join_exited_workers()
         self._repopulate_pool(joined)
         for i in range(len(joined)):
@@ -1449,6 +1644,8 @@ class Pool:
         '''
         if self._state != RUN:
             return
+        if self._require_ready:
+            self._assert_ready()
         lost_worker_timeout = lost_worker_timeout or self.lost_worker_timeout
         if chunksize == 1:
             result = IMapIterator(self._cache,
@@ -1478,6 +1675,8 @@ class Pool:
         '''
         if self._state != RUN:
             return
+        if self._require_ready:
+            self._assert_ready()
         lost_worker_timeout = lost_worker_timeout or self.lost_worker_timeout
         if chunksize == 1:
             result = IMapUnorderedIterator(
@@ -1526,6 +1725,8 @@ class Pool:
         '''
         if self._state != RUN:
             return
+        if self._require_ready:
+            self._assert_ready()
         soft_timeout = soft_timeout or self.soft_timeout
         timeout = timeout or self.timeout
         lost_worker_timeout = lost_worker_timeout or self.lost_worker_timeout
@@ -1589,6 +1790,8 @@ class Pool:
         '''
         if self._state != RUN:
             return
+        if self._require_ready:
+            self._assert_ready()
         if not hasattr(iterable, '__len__'):
             iterable = list(iterable)
 
@@ -1624,6 +1827,8 @@ class Pool:
         debug('closing pool')
         if self._state == RUN:
             self._state = CLOSE
+            self._abort_init_waiters(PoolNotReady(
+                'pool was closed before all workers were ready'))
             if self._putlock:
                 self._putlock.clear()
             self._worker_handler.close()
@@ -1633,6 +1838,8 @@ class Pool:
     def terminate(self):
         debug('terminating pool')
         self._state = TERMINATE
+        self._abort_init_waiters(PoolNotReady(
+            'pool was terminated before all workers were ready'))
         self._worker_handler.terminate()
         self._terminate()
 

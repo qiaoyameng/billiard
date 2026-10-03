@@ -38,6 +38,23 @@ class WorkerLostError(Exception):
     """The worker processing a job has exited prematurely."""
 
 
+class PoolNotReady(Exception):
+    """The pool has not finished initializing and rejects task submission."""
+
+
+class WorkerInitError(Exception):
+    """One or more worker processes failed to run their initializer.
+
+    The ``diagnostics`` attribute holds a list of ``(pid, info)`` tuples
+    describing each failure, where ``info`` is a picklable
+    :class:`billiard.einfo.ExceptionInfo` or a plain string.
+    """
+
+    def __init__(self, msg, diagnostics=()):
+        super().__init__(msg)
+        self.diagnostics = list(diagnostics)
+
+
 class Terminated(Exception):
     """The worker processing a job has been terminated by user request."""
 

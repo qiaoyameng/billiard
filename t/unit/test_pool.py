@@ -1,12 +1,18 @@
 import os
 import signal
+import threading
 import time
 
 import pytest
 
 import billiard.pool
 from billiard import get_context
-from billiard.exceptions import TimeLimitExceeded
+from billiard.exceptions import (
+    PoolNotReady,
+    TimeLimitExceeded,
+    TimeoutError as PoolTimeoutError,
+    WorkerInitError,
+)
 
 
 def func(x):
@@ -29,6 +35,21 @@ def raise_base_exception():
 
 def raise_system_exit():
     raise SystemExit(1)
+
+
+def paused_or_failing_initializer(gate, counter):
+    with counter.get_lock():
+        counter.value += 1
+        attempt = counter.value
+    if attempt == 1:
+        gate.wait()  # first worker is paused by the event
+    else:
+        raise RuntimeError('init boom')
+
+
+def paused_initializer(gate):
+    gate.wait()
+
 
 class test_pool:
     def test_memory_error_from_callback_propagates(self):
@@ -215,3 +236,118 @@ class test_pool:
         ):
             with pytest.raises(TypeError, match="bool"):
                 billiard.pool.Pool(**kwargs)
+
+    def test_initializer_barrier_retry_budget_and_reaping(self):
+        # One worker is paused inside its initializer by an event, the
+        # other fails on purpose.  The pool must not become ready, must
+        # stop restarting after the retry budget is exhausted, and must
+        # reap all processes when closed.
+        ctx = get_context()
+        gate = ctx.Event()
+        counter = ctx.Value('i', 0)
+        pool = billiard.pool.Pool(
+            2, initializer=paused_or_failing_initializer,
+            initargs=(gate, counter),
+            max_init_restarts=1, require_ready=True,
+        )
+        try:
+            # not ready: submissions are rejected
+            with pytest.raises(PoolNotReady):
+                pool.apply_async(simple_task, (1,))
+            # startup barrier: the paused worker keeps the pool unready
+            with pytest.raises(PoolTimeoutError):
+                pool.wait_until_ready(timeout=0.5)
+            # the failing worker exhausts the retry budget
+            with pytest.raises(WorkerInitError) as excinfo:
+                pool.wait_until_ready(timeout=30)
+            assert any(
+                'init boom' in str(info)
+                for _, info in excinfo.value.diagnostics
+            )
+            assert not pool.ready
+            # retry budget: 1 paused + 1 failed + exactly 1 restart
+            assert counter.value == 3
+            # still rejecting submissions after the failure
+            with pytest.raises(PoolNotReady):
+                pool.apply_async(simple_task, (1,))
+        finally:
+            gate.set()
+            pool.close()
+            pool.join()
+            pool.terminate()
+        # all worker processes are reaped after close
+        assert all(not proc.is_alive() for proc in pool._pool)
+
+    def test_ack_message_does_not_mark_pool_ready(self):
+        ctx = get_context()
+        gate = ctx.Event()
+        pool = billiard.pool.Pool(
+            1, initializer=paused_initializer, initargs=(gate,),
+            require_ready=True,
+        )
+        try:
+            assert not pool.ready
+            # an arbitrary ACK must not be mistaken for initialization
+            pool._result_handler.on_state_change((
+                billiard.pool.ACK,
+                (12345, 0, time.monotonic(), os.getpid(), None),
+            ))
+            assert not pool.ready
+            with pytest.raises(PoolNotReady):
+                pool.apply_async(simple_task, (1,))
+            gate.set()
+            assert pool.wait_until_ready(timeout=30) is True
+            assert pool.ready
+            assert pool.apply_async(simple_task, (21,)).get(timeout=10) == 42
+        finally:
+            gate.set()
+            pool.close()
+            pool.join()
+            pool.terminate()
+
+    def test_close_wakes_ready_waiters(self):
+        ctx = get_context()
+        gate = ctx.Event()
+        pool = billiard.pool.Pool(
+            1, initializer=paused_initializer, initargs=(gate,))
+        errors = []
+
+        def waiter():
+            try:
+                pool.wait_until_ready()
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        try:
+            time.sleep(0.5)  # let the waiter block on the barrier
+            pool.close()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+            assert len(errors) == 1
+            assert isinstance(errors[0], PoolNotReady)
+        finally:
+            gate.set()
+            pool.close()
+            pool.join()
+            pool.terminate()
+
+    def test_init_timeout_limits_total_wait(self):
+        ctx = get_context()
+        gate = ctx.Event()
+        pool = billiard.pool.Pool(
+            1, initializer=paused_initializer, initargs=(gate,),
+            init_timeout=1.0,
+        )
+        try:
+            started = time.monotonic()
+            with pytest.raises(PoolTimeoutError):
+                pool.wait_until_ready(timeout=30)
+            assert time.monotonic() - started < 15
+            assert not pool.ready
+        finally:
+            gate.set()
+            pool.close()
+            pool.join()
+            pool.terminate()
