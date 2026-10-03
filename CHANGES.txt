@@ -1,5 +1,17 @@
 Unreleased
 ----------
+- Add explicit shared byte blocks for pool tasks: register a bytes-like
+  payload once with `Pool.shared_bytes()` (or `billiard.share_bytes()`)
+  and pass the handle to `Pool.apply_async(..., shared=...)`; workers
+  receive a read-only view attached by segment name instead of a copy
+  through the task pipe.  Only explicitly registered payloads are shared
+  (no object-graph scanning), each block carries a generational token,
+  and in-flight references are returned when a task settles, is
+  cancelled, fails to serialize, its worker is lost, or the pool is
+  terminated; releasing the user handle does not disturb in-flight
+  tasks.  Requires `multiprocessing.shared_memory` (Python >= 3.8) and
+  works with the fork, forkserver and spawn start methods on POSIX and
+  with spawn on Windows.
 - `Queue.put()`, `Queue.get()` and `JoinableQueue.put()` raise `ValueError`
   when the queue is closed, as in `multiprocessing`, instead of an
   `AssertionError` (or, under `python -O`, silently dropping the item) and an

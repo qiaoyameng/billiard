@@ -43,6 +43,7 @@ from .exceptions import (
 )
 from time import monotonic
 from queue import Queue, Empty
+from .shared_bytes import SharedBytes, default_registry
 from .util import Finalize, debug, warning
 
 MAXMEM_USED_FMT = """\
@@ -352,7 +353,13 @@ class Worker:
                 if req:
                     type_, args_ = req
                     assert type_ == TASK
-                    job, i, fun, args, kwargs = args_
+                    job, i, fun, args, kwargs = args_[:5]
+                    shared_views = None
+                    if len(args_) > 5 and args_[5]:
+                        # shared byte blocks arrive as read-only
+                        # SharedBytesView objects attached by name.
+                        shared_views = tuple(args_[5])
+                        args = tuple(args) + shared_views
                     put((ACK, (job, i, now(), pid, synqW_fd)))
                     if _wait_for_syn:
                         confirm = wait_for_syn(job)
@@ -380,6 +387,9 @@ class Worker:
                             put((READY, (job, i, (False, einfo), inqW_fd)))
                         finally:
                             del(tb)
+                    if shared_views is not None:
+                        for shared_view in shared_views:
+                            shared_view.close()
                     completed += 1
                     if exit_exc is not None:
                         raise exit_exc
@@ -592,6 +602,13 @@ class TaskHandler(PoolThread):
         taskqueue = self.taskqueue
         put = self.put
 
+        def job_info(task):
+            # task is (TASK, (job, i, func, args, kwds[, shared]))
+            try:
+                return task[1][0], task[1][1]
+            except (IndexError, TypeError):
+                return 0, 0
+
         for taskseq, set_length in iter(taskqueue.get, None):
             task = None
             i = -1
@@ -606,7 +623,7 @@ class TaskHandler(PoolThread):
                         debug('could not put task on queue')
                         break
                     except Exception:
-                        job, ind = task[:2]
+                        job, ind = job_info(task)
                         try:
                             cache[job]._set(ind, (False, ExceptionInfo()))
                         except KeyError:
@@ -618,7 +635,7 @@ class TaskHandler(PoolThread):
                     continue
                 break
             except Exception:
-                job, ind = task[:2] if task else (0, 0)
+                job, ind = job_info(task) if task else (0, 0)
                 if job in cache:
                     cache[job]._set(ind + 1, (False, ExceptionInfo()))
                 if set_length:
@@ -997,6 +1014,7 @@ class Pool:
                  context=None,
                  max_memory_per_child=None,
                  enable_timeouts=False,
+                 shared_registry=None,
                  **kwargs):
         # bool subclasses int; processes=True would silently spawn 1 worker,
         # and timeout/soft_timeout/lost_worker_timeout=True would become 1s.
@@ -1041,6 +1059,10 @@ class Pool:
         self.threads = threads
         self.readers = {}
         self.allow_restart = allow_restart
+        self._shared_registry = (
+            shared_registry
+            if shared_registry is not None else default_registry()
+        )
 
         self.enable_timeouts = bool(
             enable_timeouts or
@@ -1502,17 +1524,38 @@ class Pool:
             ))
             return (item for chunk in result for item in chunk)
 
+    def shared_bytes(self, data):
+        """Register a bytes-like payload as a shared read-only block.
+
+        Returns a :class:`billiard.shared_bytes.SharedBytes` handle owned
+        by this process.  Pass the handle to tasks via the ``shared=``
+        parameter of :meth:`apply_async`: the bulk data never goes
+        through the task pipe, workers attach to the block by name and
+        get a read-only view.  Only explicitly registered bytes-like
+        payloads are supported; arbitrary object graphs are never
+        scanned or rewritten.
+        """
+        return self._shared_registry.register(data)
+
     def apply_async(self, func, args=(), kwds={},
                     callback=None, error_callback=None, accept_callback=None,
                     timeout_callback=None, waitforslot=None,
                     soft_timeout=None, timeout=None, lost_worker_timeout=None,
                     callbacks_propagate=(),
-                    correlation_id=None):
+                    correlation_id=None,
+                    shared=None):
         '''
         Asynchronous equivalent of `apply()` method.
 
         Callback is called when the functions return value is ready.
         The accept callback is called when the job is accepted to be executed.
+
+        `shared` may be a :class:`~billiard.shared_bytes.SharedBytes`
+        handle (or an iterable of them) registered with
+        :meth:`shared_bytes`.  The blocks do not travel through the task
+        pipe: workers attach to them by name and the function is called
+        as ``func(*args, *shared_views, **kwds)`` where each view is a
+        read-only :class:`~billiard.shared_bytes.SharedBytesView`.
 
         Simplified the flow is like this:
 
@@ -1539,6 +1582,17 @@ class Pool:
             waitforslot = self.putlocks if waitforslot is None else waitforslot
             if waitforslot and self._putlock is not None:
                 self._putlock.acquire()
+            shared_refs = None
+            if shared is not None:
+                if isinstance(shared, SharedBytes):
+                    shared = (shared,)
+                # one in-flight reference per block for this task; the
+                # reference is returned when the job settles (see
+                # ApplyResult._release_shared_refs).
+                shared_refs = tuple(
+                    self._shared_registry.acquire(handle)
+                    for handle in shared
+                )
             result = ApplyResult(
                 self._cache, callback, accept_callback, timeout_callback,
                 error_callback, soft_timeout, timeout, lost_worker_timeout,
@@ -1548,14 +1602,24 @@ class Pool:
                 send_ack=self.send_ack if self.synack else None,
                 correlation_id=correlation_id,
             )
+            if shared_refs:
+                result._shared_refs = shared_refs
+                result._shared_registry = self._shared_registry
             if timeout or soft_timeout:
                 # start the timeout handler thread when required.
                 self._start_timeout_handler()
+            task = (result._job, None, func, args, kwds, shared_refs)
             if self.threads:
-                self._taskqueue.put(([(TASK, (result._job, None,
-                                    func, args, kwds))], None))
+                self._taskqueue.put(([(TASK, task)], None))
             else:
-                self._quick_put((TASK, (result._job, None, func, args, kwds)))
+                try:
+                    self._quick_put((TASK, task))
+                except Exception:
+                    # serialization/transport failure: the task was never
+                    # sent, so return its shared references immediately.
+                    result._release_shared_refs()
+                    result.discard()
+                    raise
             return result
 
     def send_ack(self, response, job, i, fd):
@@ -1635,6 +1699,13 @@ class Pool:
         self._state = TERMINATE
         self._worker_handler.terminate()
         self._terminate()
+        # jobs that will never settle must return their shared
+        # byte block references so the segments can be reclaimed.
+        for job in list(self._cache.values()):
+            release_shared_refs = getattr(
+                job, '_release_shared_refs', None)
+            if release_shared_refs is not None:
+                release_shared_refs()
 
     @staticmethod
     def _stop_task_handler(task_handler):
@@ -1745,6 +1816,8 @@ class ApplyResult:
     _worker_lost = None
     _write_to = None
     _scheduled_for = None
+    _shared_refs = None
+    _shared_registry = None
 
     def __init__(self, cache, callback, accept_callback=None,
                  timeout_callback=None, error_callback=None, soft_timeout=None,
@@ -1797,7 +1870,14 @@ class ApplyResult:
         self._cancelled = True
 
     def discard(self):
+        self._release_shared_refs()
         self._cache.pop(self._job, None)
+
+    def _release_shared_refs(self):
+        """Return this job's in-flight shared byte block references."""
+        refs, self._shared_refs = self._shared_refs, None
+        if refs:
+            self._shared_registry.release_refs(refs)
 
     def terminate(self, signum):
         self._terminated = signum
@@ -1844,6 +1924,7 @@ class ApplyResult:
 
     def _set(self, i, obj):
         with self._mutex:
+            self._release_shared_refs()
             if self._on_timeout_cancel:
                 self._on_timeout_cancel(self)
             self._success, self._value = obj
@@ -1867,6 +1948,8 @@ class ApplyResult:
         with self._mutex:
             if self._cancelled and self._send_ack:
                 self._accepted = True
+                # the worker is NACKed and will never run this task.
+                self._release_shared_refs()
                 if synqW_fd:
                     return self._send_ack(NACK, pid, self._job, synqW_fd)
                 return

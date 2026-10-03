@@ -49,6 +49,24 @@ globals().update((name, getattr(context._default_context, name))
                  for name in context._default_context.__all__)
 __all__ = context._default_context.__all__
 
+from .shared_bytes import (  # noqa: E402
+    SharedBytes,
+    SharedBytesRegistry,
+    SharedBytesReleased,
+    SharedBytesUnsupported,
+    SharedBytesView,
+    share_bytes,
+)
+
+__all__ = tuple(__all__) + (
+    'SharedBytes',
+    'SharedBytesRegistry',
+    'SharedBytesReleased',
+    'SharedBytesUnsupported',
+    'SharedBytesView',
+    'share_bytes',
+)
+
 #
 # XXX These should not really be documented or public.
 #
